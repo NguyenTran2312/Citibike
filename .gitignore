@@ -1,1 +1,11 @@
+# Môi trường và file Python phát sinh
+.venv/
+__pycache__/
+*.pyc
 
+# Cấu hình riêng
+.env
+
+# Dữ liệu và log chạy thử
+data/
+*.log
