@@ -1,0 +1,2 @@
+{"source": "gbfs.station_status", "error_type": "VALIDATION_ERROR", "error_message": "Missing station_id", "raw_payload": {"num_bikes_available": 5}, "detected_at": "2026-11-16T08:00:00Z"}
+{"source": "gbfs.station_information", "error_type": "PARSE_ERROR", "error_message": "Payload is not valid JSON", "raw_payload": "{\"station_id\": \"abc\", ", "detected_at": "2026-11-16T08:05:00+00:00"}
