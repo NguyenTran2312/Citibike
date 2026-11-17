@@ -55,6 +55,7 @@ STATION_STATUS_SCHEMA = StructType([
 # gbfs.station_information  -- polled every 24h, own poll_id space
 # ---------------------------------------------------------------------------
 STATION_INFORMATION_SCHEMA = StructType([
+    StructField("poll_id", StringType(), True),
     StructField("last_updated", LongType(), True),              # feed update time, epoch seconds
     StructField("collected_at", StringType(), True),            # ISO-8601 datetime
     StructField("station_id", StringType(), True),              # required
