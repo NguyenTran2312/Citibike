@@ -1,0 +1,13 @@
+citibike:
+  target: dev
+  outputs:
+    dev:
+      type: trino
+      method: none
+      host: trino
+      port: 8080
+      user: dbt
+      catalog: iceberg
+      schema: gold
+      threads: 2
+      http_scheme: http
