@@ -379,10 +379,10 @@ CI ban đầu gồm đúng **ba nhóm kiểm tra**:
 
 | Người phụ trách | Công việc bắt đầu | Contract cần phối hợp |
 |---|---|---|
-| **Max — Batch** | Downloader + manifest trước; không phụ thuộc Streaming | Với **John**: `silver.trips`, timezone, dedup và quality rules. Với **Alex**: entry points, raw storage và runtime. |
-| **Tom — Streaming** | JSON Schema + Poller prototype, sau đó Kafka Producer | Với **John**: GBFS message schema, Iceberg observation grain và PostgreSQL latest-state semantics. Với **Alex**: Kafka/Spark runtime, checkpoint, recovery. |
-| **John — Data Modeling** | Hoàn thiện schema contracts cùng fixtures; mở issue riêng nghiên cứu station mapping | Review schemas và data-quality rules với Max/Tom. |
-| **Alex — Infrastructure** | MinIO, Kafka, Spark, Catalog smoke tests; CI cơ bản | Review runtime contracts, kết nối hệ thống và Airflow job-launch. |
+| **Khang — Batch** | Downloader + manifest trước; không phụ thuộc Streaming | Với **Kien**: `silver.trips`, timezone, dedup và quality rules. Với **Nguyen**: entry points, raw storage và runtime. |
+| **Quan — Streaming** | JSON Schema + Poller prototype, sau đó Kafka Producer | Với **Kien**: GBFS message schema, Iceberg observation grain và PostgreSQL latest-state semantics. Với **Nguyen**: Kafka/Spark runtime, checkpoint, recovery. |
+| **Kien — Data Modeling** | Hoàn thiện schema contracts cùng fixtures; mở issue riêng nghiên cứu station mapping | Review schemas và data-quality rules với Khang/Quan. |
+| **Nguyen — Infrastructure** | MinIO, Kafka, Spark, Catalog smoke tests; CI cơ bản | Review runtime contracts, kết nối hệ thống và Airflow job-launch. |
 
 **Nguyên tắc tích hợp:** Batch và Streaming có thể phát triển song song, nhưng giao diện dữ liệu ở ranh giới producer/consumer phải được thống nhất trước khi tích hợp.
 
