@@ -144,6 +144,37 @@ def poll_feed(feed_name, source_url):
     )
     logger.info("output=%s", output_dir)
 
+    publish_enabled = os.getenv(
+        "GBFS_PUBLISH_KAFKA",
+        "false",
+    ).lower() == "true"
+
+    if publish_enabled:
+        from ingestion.gbfs.producer import publish_poll_output
+
+        confirmed = publish_poll_output(feed_name, output_dir)
+
+        # Chỉ ghi xác nhận sau khi Kafka đã xác nhận toàn bộ.
+        (output_dir / "kafka_delivery.json").write_text(
+            json.dumps(
+                {
+                    "feed_name": feed_name,
+                    "poll_id": poll_id,
+                    "confirmed": confirmed,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        logger.info(
+            "Kafka confirmed feed=%s poll_id=%s counts=%s",
+            feed_name,
+            poll_id,
+            confirmed,
+        )
+
     return output_dir
 
 

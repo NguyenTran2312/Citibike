@@ -1,14 +1,20 @@
-# GBFS Ingestion — STR-01 và STR-02
+# GBFS Ingestion — STR-01 đến STR-03
 
 Module thu thập và chuẩn hóa dữ liệu Citi Bike GBFS 2.3.
 
 ## Trạng thái hiện tại
 
 - Đã xây dựng Pydantic models và xuất JSON Schema.
-- Đã chạy thành công 16 unit tests cho schema.
-- Poller đã chạy thành công một lần với cả hai feed.
-- Đã viết lịch polling độc lập; chưa hoàn tất kiểm thử lịch chạy.
-- Chưa tích hợp Kafka, MinIO và PostgreSQL.
+- Đã chạy thành công 29 unit tests:
+  16 schema, 4 vòng polling và 9 producer.
+- Đã chạy thử poller trong 130 giây:
+  3 lần station_status và 1 lần station_information.
+- Đã tích hợp poller với Kafka Producer.
+- Đã thử định tuyến dữ liệu lỗi sang gbfs.invalid.
+- Đã đối soát một lần polling của mỗi feed:
+  2.519 message/feed, khớp key, nội dung và số lượng.
+- Chưa tích hợp MinIO và PostgreSQL.
+- Chưa xác minh khả năng phục hồi sau crash hoặc mất kết nối.
 
 Schema hiện tại sử dụng danh sách trường chuẩn hóa do nhóm lựa chọn,
 không đại diện cho toàn bộ các trường của GBFS 2.3.
@@ -180,13 +186,16 @@ Tích hợp raw storage trên MinIO thuộc STR-04.
 python -m unittest discover -s tests/unit -p "test_gbfs*.py" -v
 ```
 
-Kết quả đã ghi nhận: 20 tests thành công.
+Kết quả đã ghi nhận: 29 tests thành công.
 
-Các test kiểm tra schema và logic vòng polling.
+Các test kiểm tra schema, logic vòng polling và producer
+với Kafka client giả lập.
+
 Chu kỳ 24 giờ được kiểm tra phép tính thời gian bằng đồng hồ giả;
 chưa chạy kiểm thử thực tế kéo dài 24 giờ.
 
-Chưa kiểm thử Kafka, MinIO, PostgreSQL hoặc khả năng phục hồi sau crash.
+Đã kiểm tra gửi/nhận và đối soát trên Kafka local.
+Chưa kiểm thử MinIO, PostgreSQL hoặc khả năng phục hồi sau crash.
 
 ## Xuất JSON Schema
 
@@ -202,9 +211,76 @@ Các file được tạo trong `ingestion/gbfs/json_schemas/`.
 
 - Review schema với người phụ trách Data Modeling / Data Quality.
 - Đồng bộ danh sách trường mới vào contract chung của nhóm.
-- Chốt chính sách xử lý `num_bikes_available = null`.
+- Chốt chính sách xử lý num_bikes_available = null.
 - Chốt grain và chính sách snapshot của information.
-- Kiểm thử lịch polling và metadata đầu ra.
-- Tích hợp Kafka Producer và topic invalid.
-- Tích hợp MinIO, retry và backoff.
+- Tích hợp MinIO, retry, backoff và jitter.
 - Xây dựng PostgreSQL consumer và kiểm thử replay/recovery.
+
+## Chạy pipeline với Kafka
+
+Chạy từ thư mục gốc repository trên máy phát triển.
+
+### Khởi động broker và tạo topic
+
+```bash
+docker compose up -d kafka
+docker compose run --rm kafka-init
+```
+
+Ba topic:
+
+- gbfs.station_status
+- gbfs.station_information
+- gbfs.invalid
+
+Script hiện dùng cấu hình thử nghiệm 3 partitions/topic,
+replication factor 1; số partition còn chờ nhóm benchmark.
+
+### Gửi một lần polling sang Kafka
+
+```bash
+GBFS_PUBLISH_KAFKA=true python -m ingestion.gbfs.poller --once
+```
+
+### Chạy liên tục và gửi Kafka
+
+```bash
+GBFS_PUBLISH_KAFKA=true python -m ingestion.gbfs.poller
+```
+
+Mặc định GBFS_PUBLISH_KAFKA=false: poller chỉ ghi file.
+
+Python chạy trên host dùng KAFKA_BOOTSTRAP_SERVERS=localhost:9092.
+Ứng dụng trong mạng Compose dùng kafka:29092.
+
+### Xác nhận gửi dữ liệu
+
+Sau khi Kafka xác nhận toàn bộ message của lần polling,
+poller ghi kafka_delivery.json trong thư mục đầu ra.
+
+File này ghi nhận số message được broker xác nhận.
+Nó không chứng minh consumer phía sau đã xử lý thành công.
+
+### Đối soát dữ liệu
+
+Thay đường dẫn dưới đây bằng thư mục polling cần kiểm tra:
+
+```bash
+python tests/integration/check_kafka_delivery.py \
+  data/gbfs/station_status/<poll_id>
+```
+
+Với information:
+
+```bash
+python tests/integration/check_kafka_delivery.py \
+  data/gbfs/station_information/<poll_id>
+```
+
+Đối soát kiểm tra key, nội dung và số lượng của các message hợp lệ.
+Status được nhận diện bằng poll_id; information bằng collected_at.
+
+Nếu gửi Kafka thất bại giữa chừng, một phần message có thể đã được ghi.
+Hiện chưa có cơ chế tự replay file cũ hoặc bảo đảm exactly-once
+cho toàn bộ pipeline.
+
