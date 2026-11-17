@@ -130,7 +130,7 @@ def poll_feed(feed_name, source_url):
                 continue
 
             valid_file.write(
-                message.model_dump_json(exclude_unset=True) + "\n"
+                message.model_dump_json() + "\n"
             )
             valid_count += 1
 
