@@ -15,10 +15,17 @@ x-s3-env: &s3-env
   PYTHONPATH: /app
   TZ: UTC
 
+# Compose labels each built image with the building service's name, so if several
+# services build the same tag they overwrite each other and every `up --build`
+# recreates them. Each image is therefore built by exactly one service per profile
+# (python: gbfs-poller / one-shot tools; spark: spark-master); the rest reuse it.
+x-python-build: &python-build
+  context: ./infra/python
+  provenance: false
+
 x-app: &app
-  build:
-    context: ./infra/python
   image: citibike/python:local
+  pull_policy: never
   working_dir: /app
   init: true
   networks: [citibike]
@@ -29,9 +36,8 @@ x-app: &app
     - ./infra/dbt/profiles.yml:/app/profiles/profiles.yml:ro
 
 x-spark: &spark
-  build:
-    context: ./infra/spark
   image: citibike/spark:3.5.6-local
+  pull_policy: never
   user: '0:0'
   init: true
   networks: [citibike]
@@ -44,10 +50,12 @@ x-spark: &spark
     - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
     - ./batch:/opt/project/batch:ro
     - ./streaming:/opt/project/streaming:ro
+    - ./tests:/opt/project/tests:ro
     - spark-ivy:/root/.ivy2
 
 x-airflow: &airflow
   image: apache/airflow:2.10.5-python3.11
+  profiles: [airflow]
   user: '${AIRFLOW_UID:-50000}:0'
   init: true
   restart: unless-stopped
@@ -67,8 +75,11 @@ x-airflow: &airflow
 
 services:
   minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-    command: [server, /data, --console-address, ':9001']
+    # MinIO stopped publishing minio/minio images. Bitnami legacy builds of the same
+    # release (commit 0d7408f, RELEASE.2025-04-22T22-12-26Z) are frozen and versioned.
+    image: ${MINIO_IMAGE:-bitnamilegacy/minio:2025.4.22}
+    entrypoint: [minio]
+    command: [server, /bitnami/minio/data, --address, ':9000', --console-address, ':9001']
     restart: unless-stopped
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-citibike}
@@ -76,7 +87,7 @@ services:
     ports:
       - '127.0.0.1:${MINIO_API_PORT:-9000}:9000'
       - '127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001'
-    volumes: [minio-data:/data]
+    volumes: [minio-data:/bitnami/minio/data]
     networks: [citibike]
     healthcheck:
       test: [CMD, curl, -f, http://localhost:9000/minio/health/live]
@@ -85,11 +96,13 @@ services:
       retries: 12
 
   minio-init:
-    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    image: ${MINIO_MC_IMAGE:-bitnamilegacy/minio-client:2025.4.16}
     restart: 'no'
     depends_on:
       minio: {condition: service_healthy}
-    environment: *s3-env
+    environment:
+      <<: *s3-env
+      MC_CONFIG_DIR: /tmp/.mc
     networks: [citibike]
     volumes:
       - ./infra/minio/init_buckets.sh:/init_buckets.sh:ro
@@ -104,8 +117,8 @@ services:
     networks: [citibike]
 
   iceberg-rest:
-    # Official development fixture. Override with an immutable digest after testing.
-    image: ${ICEBERG_REST_IMAGE:-apache/iceberg-rest-fixture:latest}
+    # Official development fixture, pinned to the digest verified with this stack.
+    image: ${ICEBERG_REST_IMAGE:-apache/iceberg-rest-fixture@sha256:009f9f6897cc1e8fd6e8133c401c7a3e7c333c71293a621d06a71570ae989c29}
     restart: unless-stopped
     depends_on:
       minio-init: {condition: service_completed_successfully}
@@ -126,6 +139,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 18
+
+  catalog-init:
+    image: ${CURL_IMAGE:-curlimages/curl:8.11.1}
+    restart: 'no'
+    depends_on:
+      iceberg-rest: {condition: service_healthy}
+    environment:
+      ICEBERG_REST_URI: http://iceberg-rest:8181
+      ICEBERG_NAMESPACES: bronze silver gold
+    volumes:
+      - ./infra/iceberg/init_namespaces.sh:/init_namespaces.sh:ro
+    entrypoint: [/bin/sh, /init_namespaces.sh]
+    networks: [citibike]
 
   kafka:
     image: apache/kafka:3.9.1
@@ -193,6 +219,10 @@ services:
 
   spark-master:
     <<: *spark
+    build:
+      context: ./infra/spark
+      provenance: false
+    pull_policy: build
     hostname: spark-master
     restart: unless-stopped
     entrypoint: [/opt/spark/bin/spark-class]
@@ -220,7 +250,7 @@ services:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-citibike}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-citibike-local-secret}
     depends_on:
-      iceberg-rest: {condition: service_healthy}
+      catalog-init: {condition: service_completed_successfully}
     volumes:
       - ./infra/trino/config.properties:/etc/trino/config.properties:ro
       - ./infra/trino/jvm.config:/etc/trino/jvm.config:ro
@@ -261,8 +291,10 @@ services:
       retries: 20
       start_period: 30s
 
+  # Airflow is INF-09: start with `docker compose --profile airflow up -d`.
   airflow-db:
     image: postgres:16.6-bookworm
+    profiles: [airflow]
     restart: unless-stopped
     environment:
       POSTGRES_USER: airflow
@@ -316,6 +348,8 @@ services:
   # Application entry points are contracts for code to be added by the team.
   gbfs-poller:
     <<: *app
+    build: *python-build
+    pull_policy: build
     profiles: [pipeline]
     restart: on-failure:5
     command: [python, -m, ingestion.gbfs.poller]
@@ -371,7 +405,7 @@ services:
     command: [--master, 'spark://spark-master:7077', --deploy-mode, client, --conf, spark.driver.host=spark-streaming, --conf, spark.driver.bindAddress=0.0.0.0, /opt/project/streaming/jobs/gbfs_history.py]
     depends_on:
       kafka-init: {condition: service_completed_successfully}
-      iceberg-rest: {condition: service_healthy}
+      catalog-init: {condition: service_completed_successfully}
       spark-master: {condition: service_healthy}
       spark-worker: {condition: service_started}
 
@@ -387,7 +421,7 @@ services:
     entrypoint: [/opt/spark/bin/spark-submit]
     command: [--master, 'spark://spark-master:7077', --deploy-mode, client, --conf, spark.driver.host=spark-batch, --conf, spark.driver.bindAddress=0.0.0.0, /opt/project/batch/jobs/trips_bronze.py]
     depends_on:
-      iceberg-rest: {condition: service_healthy}
+      catalog-init: {condition: service_completed_successfully}
       spark-master: {condition: service_healthy}
       spark-worker: {condition: service_started}
 
@@ -398,6 +432,8 @@ services:
 
   dbt:
     <<: *app
+    build: *python-build
+    pull_policy: build
     profiles: [tools]
     working_dir: /app/models/dbt
     entrypoint: [dbt]
@@ -409,6 +445,8 @@ services:
 
   trip-downloader:
     <<: *app
+    build: *python-build
+    pull_policy: build
     profiles: [tools]
     command: [python, -m, ingestion.trip_history.downloader]
     environment:
@@ -420,6 +458,8 @@ services:
 
   latest-state-reconciliation:
     <<: *app
+    build: *python-build
+    pull_policy: build
     profiles: [tools]
     command: [python, -m, serving.reconcile_latest_state]
     environment:
@@ -452,4 +492,3 @@ volumes:
   grafana-data:
   airflow-db-data:
   airflow-logs:
-# Create Service.

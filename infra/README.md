@@ -1,120 +1,144 @@
-# Hạ tầng Citi Bike theo scope.md
+# Hạ tầng Citi Bike (local Docker Compose)
 
-Compose dành cho môi trường phát triển trên một máy. Cấu hình sử dụng Kafka KRaft một broker, Spark 3.5.6 với Iceberg 1.9.2, Trino 484, Airflow 2.10.5 LocalExecutor và PostgreSQL 16.6. Đây là các lựa chọn triển khai của bản Compose.
+Stack phát triển trên một máy: Kafka KRaft 3.9.1 (1 broker), Spark 3.5.6 + Iceberg 1.9.2, Iceberg REST Catalog, MinIO, PostgreSQL 16.6, Trino 484 và Grafana 12.3. Airflow 2.10.5 nằm ở profile riêng `airflow` (INF-09, bật khi cần).
 
-## Khởi động bằng PowerShell
+Mọi lệnh dưới đây chạy ở thư mục gốc repo, trong shell bash (WSL/Linux/macOS). Trên PowerShell, các lệnh `docker compose` giữ nguyên, chỉ thay `cp` bằng `Copy-Item`.
 
-Mở Docker Desktop và bật Linux containers. Nên cấp khoảng 12–16 GB RAM cho Docker Desktop khi chạy toàn bộ hạ tầng. Phần CPU/RAM cần điều chỉnh theo kích thước job thực tế.
+## 1. Khởi động lần đầu (cả nhóm)
 
-```powershell
-Copy-Item .env.example .env
-docker compose config --quiet
-docker compose up -d
-docker compose ps -a
+Yêu cầu: Docker Engine/Docker Desktop với Compose v2, cấp khoảng 8 GB RAM cho stack mặc định (12–16 GB nếu chạy thêm Airflow và các job).
+
+```bash
+cp .env.example .env              # sửa mật khẩu trong .env; .env đã nằm trong .gitignore
+docker compose config --quiet     # kiểm tra cú pháp
+docker compose up -d --build      # lần đầu cần Internet để pull image
+docker compose ps -a              # các service phải ở trạng thái healthy / Exited (0)
+bash tests/smoke/infra_smoke.sh   # smoke test toàn bộ hạ tầng + Spark -> Iceberg -> Trino
 ```
 
-Chỉnh các tài khoản trong `.env` trước khi khởi động. Cổng trên máy được bind vào `127.0.0.1`. Mật khẩu mặc định phục vụ phát triển cục bộ. Với mật khẩu Airflow metadata chứa ký tự đặc biệt trong URL, cần URL-encode giá trị trong chuỗi kết nối tương ứng.
+Kết quả `docker compose ps -a` mong đợi:
 
-## Thành phần và dữ liệu lưu bền
+| Service | Trạng thái đúng |
+|---|---|
+| minio, iceberg-rest, kafka, postgres, spark-master, trino, grafana | `Up (healthy)` |
+| spark-worker | `Up` |
+| catalog-volume-init, minio-init, kafka-init, catalog-init | `Exited (0)`: job khởi tạo, chạy một lần, chạy lại an toàn |
 
-| Thành phần | Vai trò | URL trên máy |
+Smoke test in `[PASS]/[FAIL]` cho từng hạng mục và kết thúc bằng `Smoke test: N passed, 0 failed`. Chi tiết xem [tests/README.md](../tests/README.md).
+
+## 2. Thành phần
+
+| Thành phần | Vai trò | Từ máy host | Trong mạng `citibike` |
+|---|---|---|---|
+| MinIO | Bucket `raw`, `warehouse`, `checkpoints`, `quarantine` | API http://localhost:9000, console http://localhost:9001 | `http://minio:9000` |
+| Iceberg REST | Catalog dùng chung cho Spark và Trino; namespace `bronze`, `silver`, `gold` | http://localhost:8181/v1/config | `http://iceberg-rest:8181` |
+| Kafka | Topic `gbfs.station_status`, `gbfs.station_information`, `gbfs.invalid` (3 partition, RF 1, giữ 7 ngày) | `localhost:9092` | `kafka:29092` |
+| Spark master / worker | Cluster standalone, worker 2 core / 4 GB | UI http://localhost:8081, http://localhost:8082 | `spark://spark-master:7077` |
+| PostgreSQL | DB `citibike`: `station_status_latest`, `active_alerts` | `localhost:5432` | `postgres:5432` |
+| Trino | SQL trên Iceberg, catalog `iceberg` | http://localhost:8080 | `http://trino:8080` |
+| Grafana | Datasource PostgreSQL + Trino provision sẵn | http://localhost:3000 | `http://grafana:3000` |
+| Airflow (profile `airflow`) | Scheduler, webserver, metadata DB riêng | http://localhost:8083 | - |
+
+Tài khoản lấy từ `.env`. Port host chỉ bind vào `127.0.0.1`.
+
+Quy ước bảng: Spark dùng catalog `lakehouse` (catalog mặc định) nên viết `lakehouse.bronze.<table>` hoặc `bronze.<table>`; Trino đọc cùng bảng qua `iceberg.bronze.<table>`. Dữ liệu bảng Iceberg dùng `s3://warehouse/` (S3FileIO); checkpoint Structured Streaming dùng `s3a://checkpoints/...` (Hadoop S3A).
+
+### Các job khởi tạo (chạy lại an toàn)
+
+| Job | Script | Việc làm |
 |---|---|---|
-| MinIO | Các bucket raw, warehouse, checkpoints và quarantine | API http://localhost:9000, console http://localhost:9001 |
-| Iceberg REST | Danh mục dùng chung cho Spark và Trino | http://localhost:8181/v1/config |
-| Kafka | Topic station_status, station_information và invalid | localhost:9092 |
-| Spark master | Nhận job từ spark-submit | UI http://localhost:8081 |
-| Spark worker | Chạy task, mặc định 2 core / 4 GB | UI http://localhost:8082 |
-| Trino | SQL trên Iceberg, catalog iceberg | http://localhost:8080 |
-| PostgreSQL | CSDL citibike phục vụ latest state và active alerts | localhost:5432 |
-| Grafana | Datasource PostgreSQL và Trino được provision sẵn | http://localhost:3000 |
-| Airflow | Scheduler, webserver và metadata DB riêng | http://localhost:8083 |
+| `minio-init` | [minio/init_buckets.sh](minio/init_buckets.sh) | `mc mb --ignore-existing` cho 4 bucket |
+| `kafka-init` | [kafka/init_topics.sh](kafka/init_topics.sh) | Tạo 3 topic và áp lại config retention/cleanup |
+| `catalog-init` | [iceberg/init_namespaces.sh](iceberg/init_namespaces.sh) | Tạo namespace `bronze`, `silver`, `gold` qua REST API (409 = đã có) |
+| `catalog-volume-init` | (inline) | Đặt quyền volume SQLite của catalog |
+| PostgreSQL init | [postgres/init.sql](postgres/init.sql) | Tạo bảng serving, **chỉ chạy khi volume `postgres-data` còn mới** |
 
-Các tài khoản lấy từ `.env.example` hoặc `.env`. Kafka dùng `kafka:29092` khi truy cập giữa các container. Spark dùng `spark://spark-master:7077`. Các endpoint nội bộ giữ nguyên khi thay cổng host.
+## 3. Lệnh cho từng thành viên
 
-MinIO, Kafka, PostgreSQL, Grafana, Airflow metadata/logs và REST Catalog có named volume. REST fixture dùng JdbcCatalog với SQLite lưu trong volume `catalog-data`. Phù hợp cho một instance phát triển, cần thay catalog backend khi triển khai nhiều replica. `catalog-volume-init` chỉ đặt quyền thư mục. `minio-init` và `kafka-init` tạo bucket/topic theo cách có thể chạy lại.
+Các entry point dưới đây đã khai báo trong Compose (env, volume, dependency). Chúng chỉ chạy được khi module ứng dụng tương ứng đã được viết; nếu chưa có file, container sẽ báo lỗi thiếu module/file.
 
-Image REST fixture chính thức hiện dùng tag `latest`, theo quickstart Apache Iceberg. Sau khi thử nghiệm, đặt `ICEBERG_REST_IMAGE=apache/iceberg-rest-fixture@sha256:...` để cố định bản image đã kiểm chứng. Grafana tải plugin `trino-datasource` ở lần khởi động, cần truy cập Internet. Hai thành phần này chưa khóa hoàn toàn phiên bản qua digest.
+**Khang (Batch)**: cần `ingestion/trip_history/downloader.py`, `batch/jobs/trips_bronze.py`, `batch/jobs/trips_silver.py`:
 
-## Hợp đồng cho mã ứng dụng
-
-Scope có hai nhánh consumer độc lập. Profile `pipeline` khai báo các container ứng dụng dưới đây. Các entry point này cần được nhóm triển khai trước khi bật profile.
-
-| Service | Entry point cần có | Trách nhiệm |
-|---|---|---|
-| gbfs-poller | ingestion/gbfs/poller.py | Discovery GBFS 2.3, lấy hai feed theo TTL, lưu raw JSON, Pydantic validation và Kafka producer |
-| latest-state-consumer | serving/latest_state_consumer.py | UPSERT observation mới hơn vào PostgreSQL, cập nhật station_status_latest và active_alerts theo infra/postgres/init.sql |
-| spark-streaming | streaming/jobs/gbfs_history.py | Lưu Bronze/Silver Iceberg, dedup observation, checkpoint và replay |
-| spark-batch | batch/jobs/trips_bronze.py và batch/jobs/trips_silver.py | Đọc manifest/raw trên MinIO, làm sạch và khử trùng ride_id, ghi Silver |
-
-infra/postgres/init.sql khởi tạo hai bảng serving khi volume PostgreSQL còn mới. Compose chưa triển khai logic Python, dbt models, DAG hoặc các biểu đồ dashboard. Mỗi service ứng dụng được cấu hình sẵn biến môi trường, volume và dependency. Chạy profile khi entry point chưa tồn tại sẽ báo lỗi module/file bị thiếu.
-
-```powershell
-# Sau khi có mã cho cả ba ứng dụng liên tục
-docker compose --profile pipeline up -d --build gbfs-poller latest-state-consumer spark-streaming
-
-# Job batch một lần, sau khi triển khai batch/jobs/trips_bronze.py và batch/jobs/trips_silver.py
+```bash
+docker compose --profile tools run --rm trip-downloader
 docker compose --profile tools run --rm spark-batch
 docker compose --profile tools run --rm spark-batch-silver
-
-# Đặt project dbt trong models/dbt/, có profile: citibike trong dbt_project.yml
-docker compose --profile tools run --rm dbt debug
-docker compose --profile tools run --rm dbt build
 ```
 
-Image Python cài requirements tại build. Spark tải Iceberg, Kafka và Hadoop S3A jars từ Maven ở lần spark-submit đầu, cache ở `spark-ivy`. Job và executor sử dụng cùng image Spark. Prefix bảng Spark là `lakehouse.bronze`, `lakehouse.silver`, `lakehouse.gold`. Trino truy cập các namespace tương ứng bằng `iceberg.bronze`, `iceberg.silver`, `iceberg.gold`.
+**Quan (Streaming ingestion)**: cần `ingestion/gbfs/poller.py`, `serving/latest_state_consumer.py`:
 
-Airflow có thư mục DAG tại `infra/airflow/dags/`. Nhóm cần bổ sung DAG và provider/runtime phù hợp với operator lựa chọn để điều phối downloader, Spark, dbt và maintenance. LocalExecutor hiện cung cấp nền tảng scheduler/webserver và metadata DB. Các ứng dụng chạy liên tục là service riêng trong Compose.
-
-## Quy tắc dữ liệu khi triển khai job
-
-- Đọc CSV timestamps bằng schema có chủ đích, giữ giờ raw và local. Session Spark dùng UTC, còn múi giờ nguồn Trip History áp dụng America/New_York và xử lý AMBIGUOUS/NONEXISTENT.
-- Mã station_id là chuỗi. Bridge nối Trip station_id với GBFS station_information.short_name, sau đó dùng station_id GBFS cho các feed.
-- Consumer PostgreSQL và Spark có nhóm đọc Kafka độc lập. Spark checkpoint là nguồn quản lý offset cho job lịch sử. Job phải cấu hình khóa dedup và tính idempotent khi replay.
-- `CHECKPOINT_LOCATION` sử dụng `s3a://` qua Hadoop S3A. Dữ liệu bảng Iceberg sử dụng `s3://` qua S3FileIO.
-- Chu kỳ lấy GBFS mục tiêu 60 giây. Streaming trigger mặc định 5 phút, điều chỉnh bằng STREAM_TRIGGER_INTERVAL. Các job cần đọc các biến này.
-- LOW_BIKES mặc định 2 xe, STALE mặc định đề xuất 180 giây. Tính STALE bằng thời gian hiện tại và last_reported, bao gồm lúc poller dừng. Consumer/SQL/Grafana cần triển khai phép tính và cơ chế cập nhật cảnh báo tương ứng.
-- Khôi phục PostgreSQL từ Iceberg, compaction và đối soát được triển khai bằng job/DAG của nhóm. Dữ liệu PostgreSQL cập nhật trực tiếp từ Kafka consumer như scope.
-
-## Kiểm tra và dừng
-
-```powershell
-docker compose --profile pipeline --profile tools config --quiet
-docker compose logs --tail 100 iceberg-rest kafka trino airflow-scheduler
-docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
-docker compose exec trino trino --execute "SHOW SCHEMAS FROM iceberg"
-docker compose exec postgres psql -U citibike -d citibike -c "SELECT now();"
-docker compose stop
+```bash
+docker compose --profile pipeline up -d --build gbfs-poller latest-state-consumer
 ```
 
-Thay `citibike` bằng POSTGRES_USER khi đã đổi tài khoản. `stop` giữ các named volume để chạy tiếp. Bản Compose đã được kiểm tra bằng `docker compose config` cho cả profile `pipeline` và `tools`. Docker Engine tại máy tạo file chưa chạy nên chưa kiểm thử pull/build, healthcheck hoặc các kết nối giữa container.
+**Nguyen (Spark Streaming)**: `streaming/jobs/gbfs_history.py`:
 
-## Tài liệu cấu hình đã đối chiếu
+```bash
+docker compose --profile pipeline up -d spark-streaming
+```
+
+**Kien (dbt)**: cần `models/dbt/dbt_project.yml` với `profile: citibike`:
+
+```bash
+docker compose --profile tools run --rm dbt debug --profiles-dir /app/profiles
+docker compose --profile tools run --rm dbt build --profiles-dir /app/profiles
+```
+
+Lần đầu chạy, image Python (`citibike/python:local`) được build từ [python/requirements.txt](python/requirements.txt); Spark tải jar Iceberg/Kafka/S3A từ Maven ở lần `spark-submit` đầu và cache vào volume `spark-ivy`.
+
+Truy vấn nhanh để kiểm tra kết quả:
+
+```bash
+docker compose exec trino trino --execute "SHOW TABLES FROM iceberg.silver"
+docker compose exec postgres psql -U citibike -d citibike -c "SELECT count(*) FROM station_status_latest"
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:29092 --topic gbfs.station_status --from-beginning --max-messages 5
+```
+
+(Thay `citibike` bằng `POSTGRES_USER` nếu đã đổi trong `.env`.)
+
+## 4. Biến môi trường
+
+Danh sách đầy đủ và giải thích nằm trong [.env.example](../.env.example). Mọi biến đều có giá trị mặc định cho local trong `docker-compose.yml`, nên stack vẫn chạy khi chưa có `.env`; tuy vậy nên tạo `.env` để đặt mật khẩu riêng. Không commit `.env`.
+
+Lưu ý: user/password PostgreSQL và Airflow DB chỉ được áp dụng khi volume được tạo lần đầu. Đổi mật khẩu sau đó cần đổi trong DB, hoặc xóa volume nếu chấp nhận mất dữ liệu.
+
+## 5. Xử lý sự cố
+
+| Triệu chứng | Nguyên nhân và cách xử lý |
+|---|---|
+| `Bind for 127.0.0.1:5432 failed: port is already allocated` hoặc postgres không lên | Port đang bị chiếm (thường là PostgreSQL cài sẵn trong WSL: `sudo service postgresql stop`, hoặc container lab cũ: `docker stop <tên>`). Giữ port mặc định, dừng tiến trình đang chiếm port thay vì đổi port. Kiểm tra: `ss -ltnp \| grep 5432` |
+| Port 9092/8080/… bị chiếm | Như trên. `docker ps` để tìm container cũ (vd. lab Kafka) rồi `docker stop` |
+| `pull access denied for minio/minio` | MinIO đã ngừng phát hành image Docker. Compose dùng `bitnamilegacy/minio:2025.4.22` (cùng commit với RELEASE.2025-04-22). Không đổi lại `minio/minio` |
+| `catalog-init` hoặc `trino` không lên | Xem `docker compose logs iceberg-rest catalog-init`; iceberg-rest cần MinIO đã healthy và bucket đã tạo |
+| Spark job treo ở `Initial job has not accepted any resources` | Worker hết core (mỗi app dùng tối đa 1 core, worker có 2). Dừng bớt job hoặc tăng `SPARK_WORKER_CORES` |
+| `error mounting ... to rootfs at "/init_topics.sh"` (Docker Desktop + WSL) | Container init cũ giữ bind mount tới phiên bản file trước khi sửa. Tạo lại: `docker compose rm -f kafka-init` (hoặc `minio-init`, `catalog-init`) rồi `docker compose up -d` |
+| `No such image: citibike/spark:3.5.6-local` khi chạy job profile `tools`/`pipeline` | Chưa build image Spark: chạy `docker compose up -d --build` (stack mặc định) trước |
+| Grafana không cài được `trino-datasource` | Plugin tải từ Internet lúc khởi động; kiểm tra mạng rồi `docker compose restart grafana` |
+
+Xem log: `docker compose logs --tail 100 <service>`.
+
+## 6. Dừng và dọn dẹp
+
+```bash
+docker compose stop                 # dừng, giữ dữ liệu
+docker compose down                 # xóa container, giữ named volumes
+docker compose down -v              # XÓA toàn bộ dữ liệu (MinIO, Kafka, catalog, Postgres...)
+```
+
+## 7. Ghi chú thiết kế
+
+- **Iceberg REST Catalog** dùng image fixture chính thức (`apache/iceberg-rest-fixture`, khóa theo digest) với JdbcCatalog trên SQLite trong volume `catalog-data`. Phù hợp cho một instance phát triển; triển khai nhiều replica cần catalog backend khác (xem mục HA trong `docs/contracts.md`).
+- **MinIO** dùng bản build Bitnami legacy vì image `minio/minio` không còn tải được; phiên bản không đổi so với cấu hình ban đầu.
+- **Spark**: driver và executor dùng chung image [spark/Dockerfile](spark/Dockerfile), cùng `PYTHONPATH=/opt/project` và các mount `batch/`, `streaming/`, `tests/`. `spark.cores.max=1` để batch và streaming chia sẻ worker 2 core.
+- **Build image**: mỗi image chỉ do một service build (`spark-master` cho `citibike/spark`, `gbfs-poller`/các tool một lần cho `citibike/python`), các service khác dùng lại với `pull_policy: never`. Nếu nhiều service cùng build một tag, Compose gắn nhãn tên service vào image nên các bản build ghi đè nhau và mỗi lần `up -d --build` sẽ tạo lại container (làm đứt job streaming). Vì vậy các service profile `tools`/`pipeline` dùng image Spark cần stack mặc định đã được `up` ít nhất một lần.
+- **Airflow** (INF-09) chưa có DAG; bật bằng `docker compose --profile airflow up -d`. DAG đặt trong `infra/airflow/dags/`.
+- **Grafana/dbt** (INF-06): datasource và profile đã có; dashboard JSON đặt trong `infra/grafana/dashboards/`.
+
+## Tài liệu tham chiếu
 
 - [Apache Iceberg Spark quickstart](https://iceberg.apache.org/spark-quickstart/)
-- [REST fixture Dockerfile](https://github.com/apache/iceberg/blob/main/docker/iceberg-rest-fixture/Dockerfile)
+- [Iceberg REST fixture](https://github.com/apache/iceberg/blob/main/docker/iceberg-rest-fixture/Dockerfile)
 - [Apache Kafka 3.9 quickstart](https://kafka.apache.org/39/getting-started/quickstart/)
-- [Trino S3 filesystem](https://trino.io/docs/current/object-storage/file-system-s3.html)
-- [Airflow 2.10.5 Docker](https://airflow.apache.org/docs/apache-airflow/2.10.5/howto/docker-compose/index.html)
+- [Trino S3 file system](https://trino.io/docs/current/object-storage/file-system-s3.html)
+- [Airflow 2.10.5 Docker Compose](https://airflow.apache.org/docs/apache-airflow/2.10.5/howto/docker-compose/index.html)
 - [Grafana Trino datasource](https://github.com/trinodb/grafana-trino)
-
-## Các đường dẫn theo cây thư mục dự án
-
-- Poller chạy bằng `python -m ingestion.gbfs.poller` và sử dụng producer/schemas trong cùng package.
-- Latest consumer chạy bằng `python -m serving.latest_state_consumer`.
-- `spark-streaming` gọi `streaming/jobs/gbfs_history.py`. Entry point này cần khởi chạy các truy vấn Bronze/Silver và station information trong cùng driver. Mỗi truy vấn phải có checkpoint riêng dưới CHECKPOINT_LOCATION và giữ tiến trình bằng awaitAnyTermination.
-- Các job Spark có PYTHONPATH=/opt/project, driver và worker dùng cùng Dockerfile và cùng đường dẫn mount.
-- Job `spark-batch` ghi Bronze, `spark-batch-silver` ghi Silver. Chạy Bronze thành công trước Silver.
-- `trip-downloader` chạy `ingestion/trip_history/downloader.py` với phạm vi tháng 1–10/2026.
-- `latest-state-reconciliation` chạy `serving/reconcile_latest_state.py`, truy vấn Iceberg qua Trino và ghi PostgreSQL.
-- dbt dùng project models/dbt/ và profile infra/dbt/profiles.yml. Nhóm cần tạo dbt_project.yml với profile citibike.
-- Grafana tự đọc dashboard JSON tại infra/grafana/dashboards/ khi các file dashboard được bổ sung.
-- init SQL chỉ chạy trên volume PostgreSQL mới. Với volume đã có dữ liệu, áp dụng migration phù hợp thay vì xóa volume.
-
-Các lệnh chạy công cụ sau khi nhóm bổ sung mã ứng dụng:
-
-```powershell
-docker compose --profile tools run --rm trip-downloader
-docker compose --profile tools run --rm latest-state-reconciliation
-```
-
-Mặc định một ứng dụng Spark chiếm tối đa một core, worker có hai core để batch và streaming có thể chia sẻ cluster. Điều chỉnh tài nguyên sau khi đo workload. Airflow hiện dùng image chính thức và LocalExecutor. DAG gọi Spark/dbt/container cần được triển khai với operator, provider và runtime tương ứng trước khi có thể chạy tác vụ. Các thư mục mã ứng dụng hiện là scaffold, chưa có logic pipeline.
