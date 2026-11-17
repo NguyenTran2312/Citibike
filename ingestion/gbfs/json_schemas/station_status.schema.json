@@ -1,7 +1,6 @@
 {
   "$defs": {
     "VehicleTypeAvailable": {
-      "additionalProperties": true,
       "properties": {
         "vehicle_type_id": {
           "minLength": 1,
@@ -22,20 +21,8 @@
       "type": "object"
     }
   },
-  "additionalProperties": true,
-  "description": "Dữ liệu trạm và metadata nằm cùng cấp trong message.",
+  "description": "Message station_status chuẩn hóa.",
   "properties": {
-    "schema_version": {
-      "const": 1,
-      "default": 1,
-      "title": "Schema Version",
-      "type": "integer"
-    },
-    "poll_id": {
-      "minLength": 1,
-      "title": "Poll Id",
-      "type": "string"
-    },
     "last_updated": {
       "minimum": 0,
       "title": "Last Updated",
@@ -45,6 +32,17 @@
       "format": "date-time",
       "title": "Collected At",
       "type": "string"
+    },
+    "poll_id": {
+      "minLength": 1,
+      "title": "Poll Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
     },
     "station_id": {
       "minLength": 1,
@@ -78,71 +76,6 @@
       "title": "Last Reported",
       "type": "integer"
     },
-    "num_bikes_disabled": {
-      "anyOf": [
-        {
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Num Bikes Disabled"
-    },
-    "num_docks_disabled": {
-      "anyOf": [
-        {
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Num Docks Disabled"
-    },
-    "num_ebikes_available": {
-      "anyOf": [
-        {
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Num Ebikes Available"
-    },
-    "num_scooters_available": {
-      "anyOf": [
-        {
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Num Scooters Available"
-    },
-    "num_scooters_unavailable": {
-      "anyOf": [
-        {
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Num Scooters Unavailable"
-    },
     "vehicle_types_available": {
       "anyOf": [
         {
@@ -160,9 +93,9 @@
     }
   },
   "required": [
-    "poll_id",
     "last_updated",
     "collected_at",
+    "poll_id",
     "station_id",
     "num_bikes_available",
     "num_docks_available",

@@ -1,63 +1,6 @@
 {
-  "$defs": {
-    "RentalURIs": {
-      "additionalProperties": true,
-      "properties": {
-        "android": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Android"
-        },
-        "ios": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Ios"
-        },
-        "web": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Web"
-        }
-      },
-      "title": "RentalURIs",
-      "type": "object"
-    }
-  },
-  "additionalProperties": true,
-  "description": "Message thông tin trạm chuẩn hóa.",
+  "description": "Message station_information không có poll_id/schema_version.",
   "properties": {
-    "schema_version": {
-      "const": 1,
-      "default": 1,
-      "title": "Schema Version",
-      "type": "integer"
-    },
-    "poll_id": {
-      "minLength": 1,
-      "title": "Poll Id",
-      "type": "string"
-    },
     "last_updated": {
       "minimum": 0,
       "title": "Last Updated",
@@ -126,45 +69,9 @@
       ],
       "default": null,
       "title": "Is Virtual Station"
-    },
-    "region_id": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Region Id"
-    },
-    "is_charging": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Is Charging"
-    },
-    "rental_uris": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/RentalURIs"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null
     }
   },
   "required": [
-    "poll_id",
     "last_updated",
     "collected_at",
     "station_id",

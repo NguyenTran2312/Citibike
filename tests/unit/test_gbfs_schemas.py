@@ -5,6 +5,7 @@ from pydantic import ValidationError
 from ingestion.gbfs.schemas import (
     InvalidMessage,
     StationInformation,
+    StationInformationMessage,
     StationStatus,
     StationStatusMessage,
 )
@@ -94,14 +95,21 @@ class TestGBFSSchemas(unittest.TestCase):
         self.assertNotIn("num_scooters_available", exported)
         self.assertNotIn("num_scooters_unavailable", exported)
 
-    def test_unknown_source_field_is_preserved(self):
-        row = {**self.status, "future_source_field": {"value": 7}}
-        result = StationStatus.model_validate(row)
+    def test_unknown_source_field_is_excluded(self):
+        row = {
+            **self.status,
+            "future_source_field": {"value": 7},
+            "num_bikes_disabled": 2,
+        }
 
-        self.assertEqual(
-            result.model_dump()["future_source_field"],
-            {"value": 7},
-        )
+        result = StationStatus.model_validate(row)
+        exported = result.model_dump()
+
+        self.assertNotIn("future_source_field", exported)
+        self.assertNotIn("num_bikes_disabled", exported)
+
+        # Việc validate không được sửa dictionary đầu vào.
+        self.assertIn("future_source_field", row)
 
     def test_old_last_reported_is_preserved(self):
         row = {**self.status, "last_reported": 86400}
@@ -183,7 +191,42 @@ class TestGBFSSchemas(unittest.TestCase):
 
         with self.assertRaises(ValidationError):
             InvalidMessage.model_validate(row)
+    def test_information_message_has_only_requested_fields(self):
+        result = StationInformationMessage.model_validate({
+            **self.information,
+            **self.metadata,
+            "region_id": "71",
+            "is_charging": False,
+            "rental_uris": {"ios": "https://example.com"},
+        })
 
+        exported = result.model_dump(mode="json")
+
+        expected_fields = {
+            "last_updated",
+            "collected_at",
+            "station_id",
+            "name",
+            "lat",
+            "lon",
+            "short_name",
+            "capacity",
+            "is_virtual_station",
+        }
+
+        self.assertEqual(set(exported), expected_fields)
+
+    def test_status_version_must_be_integer_one(self):
+        for value in (0, 2, True, "1", 1.0):
+            with self.subTest(value=value):
+                row = {
+                    **self.status,
+                    **self.metadata,
+                    "schema_version": value,
+                }
+
+                with self.assertRaises(ValidationError):
+                    StationStatusMessage.model_validate(row)
 
 if __name__ == "__main__":
     unittest.main()
