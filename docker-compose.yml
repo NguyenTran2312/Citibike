@@ -199,7 +199,7 @@ services:
     command: [org.apache.spark.deploy.master.Master, --host, spark-master, --port, '7077', --webui-port, '8080']
     ports: ['127.0.0.1:${SPARK_UI_PORT:-8081}:8080']
     healthcheck:
-      test: [CMD-SHELL, 'bash -c "echo > /dev/tcp/localhost/7077"']
+      test: [CMD-SHELL, 'bash -c "echo > /dev/tcp/spark-master/7077"']
       interval: 10s
       timeout: 5s
       retries: 12
@@ -363,7 +363,8 @@ services:
       KAFKA_GROUP_ID: citibike-iceberg-history
       GBFS_STATUS_TOPIC: gbfs.station_status
       GBFS_INFORMATION_TOPIC: gbfs.station_information
-      CHECKPOINT_LOCATION: s3a://checkpoints/gbfs-history/
+      STATUS_CHECKPOINT_LOCATION: s3a://checkpoints/status-history/
+      INFORMATION_CHECKPOINT_LOCATION: s3a://checkpoints/information-history/
       STREAM_TRIGGER_INTERVAL: ${STREAM_TRIGGER_INTERVAL:-5 minutes}
     entrypoint: [/opt/spark/bin/spark-submit]
     command: [--master, 'spark://spark-master:7077', --deploy-mode, client, --conf, spark.driver.host=spark-streaming, --conf, spark.driver.bindAddress=0.0.0.0, /opt/project/streaming/jobs/gbfs_history.py]

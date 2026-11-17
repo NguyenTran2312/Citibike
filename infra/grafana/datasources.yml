@@ -1,0 +1,24 @@
+apiVersion: 1
+datasources:
+  - name: Citi Bike Latest State
+    uid: citibike-postgres
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: $POSTGRES_USER
+    isDefault: true
+    jsonData:
+      database: citibike
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+    secureJsonData:
+      password: $POSTGRES_PASSWORD
+  - name: Citi Bike Historical Analytics
+    uid: citibike-trino
+    type: trino-datasource
+    access: proxy
+    url: http://trino:8080
+    jsonData:
+      catalog: iceberg
+      schema: gold
