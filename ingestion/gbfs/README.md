@@ -174,16 +174,19 @@ Tích hợp raw storage trên MinIO thuộc STR-04.
 - Retry có giới hạn, backoff, jitter và xử lý lỗi cấp feed đầy đủ
   chưa được triển khai.
 
-## Chạy test schema
+## Chạy unit tests GBFS
 
 ```bash
-python -m unittest discover -s tests/unit -p "test_gbfs_schemas.py" -v
+python -m unittest discover -s tests/unit -p "test_gbfs*.py" -v
 ```
 
-Kết quả đã ghi nhận: 16 tests thành công.
+Kết quả đã ghi nhận: 20 tests thành công.
 
-Các test này chưa xác nhận lịch polling, Kafka, MinIO,
-PostgreSQL hoặc khả năng phục hồi sau crash.
+Các test kiểm tra schema và logic vòng polling.
+Chu kỳ 24 giờ được kiểm tra phép tính thời gian bằng đồng hồ giả;
+chưa chạy kiểm thử thực tế kéo dài 24 giờ.
+
+Chưa kiểm thử Kafka, MinIO, PostgreSQL hoặc khả năng phục hồi sau crash.
 
 ## Xuất JSON Schema
 
