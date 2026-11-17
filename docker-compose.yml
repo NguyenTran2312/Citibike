@@ -1,6 +1,11 @@
 # Local development stack for scope.md. See infra/README.md for job entry points.
 name: citibike
 
+# Config files are bind-mounted as directories, never as single files: Docker
+# Desktop on WSL keeps a single-file mount pointing at the old file once git
+# rewrites it (pull/switch/rebase), and the container then fails to start with
+# "error mounting ... no such file or directory".
+
 x-s3-env: &s3-env
   AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-citibike}
   AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-citibike-local-secret}
@@ -33,7 +38,7 @@ x-app: &app
     - ./ingestion:/app/ingestion:ro
     - ./serving:/app/serving:ro
     - ./models:/app/models
-    - ./infra/dbt/profiles.yml:/app/profiles/profiles.yml:ro
+    - ./infra/dbt:/app/profiles:ro
 
 x-spark: &spark
   image: citibike/spark:3.5.6-local
@@ -47,7 +52,7 @@ x-spark: &spark
     PYSPARK_PYTHON: python3
     PYSPARK_DRIVER_PYTHON: python3
   volumes:
-    - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    - ./infra/spark:/opt/spark/conf:ro
     - ./batch:/opt/project/batch:ro
     - ./streaming:/opt/project/streaming:ro
     - ./tests:/opt/project/tests:ro
@@ -105,8 +110,8 @@ services:
       MC_CONFIG_DIR: /tmp/.mc
     networks: [citibike]
     volumes:
-      - ./infra/minio/init_buckets.sh:/init_buckets.sh:ro
-    entrypoint: [/bin/sh, /init_buckets.sh]
+      - ./infra/minio:/scripts:ro
+    entrypoint: [/bin/sh, /scripts/init_buckets.sh]
 
   catalog-volume-init:
     image: busybox:1.37.0
@@ -149,8 +154,8 @@ services:
       ICEBERG_REST_URI: http://iceberg-rest:8181
       ICEBERG_NAMESPACES: bronze silver gold
     volumes:
-      - ./infra/iceberg/init_namespaces.sh:/init_namespaces.sh:ro
-    entrypoint: [/bin/sh, /init_namespaces.sh]
+      - ./infra/iceberg:/scripts:ro
+    entrypoint: [/bin/sh, /scripts/init_namespaces.sh]
     networks: [citibike]
 
   kafka:
@@ -193,8 +198,8 @@ services:
       kafka: {condition: service_healthy}
     networks: [citibike]
     volumes:
-      - ./infra/kafka/init_topics.sh:/init_topics.sh:ro
-    entrypoint: [/bin/bash, /init_topics.sh]
+      - ./infra/kafka:/scripts:ro
+    entrypoint: [/bin/bash, /scripts/init_topics.sh]
 
   postgres:
     image: postgres:16.6-bookworm
@@ -208,7 +213,7 @@ services:
     command: [postgres, -c, timezone=UTC]
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-serving.sql:ro
+      - ./infra/postgres:/docker-entrypoint-initdb.d:ro
     ports: ['127.0.0.1:${POSTGRES_PORT:-5432}:5432']
     networks: [citibike]
     healthcheck:
@@ -252,9 +257,7 @@ services:
     depends_on:
       catalog-init: {condition: service_completed_successfully}
     volumes:
-      - ./infra/trino/config.properties:/etc/trino/config.properties:ro
-      - ./infra/trino/jvm.config:/etc/trino/jvm.config:ro
-      - ./infra/trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      - ./infra/trino:/etc/trino:ro
     ports: ['127.0.0.1:${TRINO_PORT:-8080}:8080']
     networks: [citibike]
     healthcheck:
@@ -279,7 +282,7 @@ services:
       trino: {condition: service_healthy}
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./infra/grafana/datasources.yml:/etc/grafana/provisioning/datasources/citibike.yml:ro
+      - ./infra/grafana:/etc/grafana/provisioning/datasources:ro
       - ./infra/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports: ['127.0.0.1:${GRAFANA_PORT:-3000}:3000']
