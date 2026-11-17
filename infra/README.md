@@ -111,7 +111,7 @@ Lưu ý: user/password PostgreSQL và Airflow DB chỉ được áp dụng khi v
 | `pull access denied for minio/minio` | MinIO đã ngừng phát hành image Docker. Compose dùng `bitnamilegacy/minio:2025.4.22` (cùng commit với RELEASE.2025-04-22). Không đổi lại `minio/minio` |
 | `catalog-init` hoặc `trino` không lên | Xem `docker compose logs iceberg-rest catalog-init`; iceberg-rest cần MinIO đã healthy và bucket đã tạo |
 | Spark job treo ở `Initial job has not accepted any resources` | Worker hết core (mỗi app dùng tối đa 1 core, worker có 2). Dừng bớt job hoặc tăng `SPARK_WORKER_CORES` |
-| `error mounting ... to rootfs at "/init_topics.sh"` (Docker Desktop + WSL) | Container init cũ giữ bind mount tới phiên bản file trước khi sửa. Tạo lại: `docker compose rm -f kafka-init` (hoặc `minio-init`, `catalog-init`) rồi `docker compose up -d` |
+| `error mounting ... to rootfs at "/init_topics.sh"` (Docker Desktop + WSL) | Container tạo từ bản Compose cũ (mount từng file) giữ mount tới file trước khi git ghi lại. Bản hiện tại chỉ mount thư mục nên không còn lỗi này; với container cũ, tạo lại: `docker compose up -d --force-recreate`. Khi thêm mount mới, luôn mount thư mục, không mount từng file |
 | `No such image: citibike/spark:3.5.6-local` khi chạy job profile `tools`/`pipeline` | Chưa build image Spark: chạy `docker compose up -d --build` (stack mặc định) trước |
 | Grafana không cài được `trino-datasource` | Plugin tải từ Internet lúc khởi động; kiểm tra mạng rồi `docker compose restart grafana` |
 
