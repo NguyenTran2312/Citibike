@@ -1,0 +1,178 @@
+{
+  "$defs": {
+    "RentalURIs": {
+      "additionalProperties": true,
+      "properties": {
+        "android": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Android"
+        },
+        "ios": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ios"
+        },
+        "web": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Web"
+        }
+      },
+      "title": "RentalURIs",
+      "type": "object"
+    }
+  },
+  "additionalProperties": true,
+  "description": "Message thông tin trạm chuẩn hóa.",
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "poll_id": {
+      "minLength": 1,
+      "title": "Poll Id",
+      "type": "string"
+    },
+    "last_updated": {
+      "minimum": 0,
+      "title": "Last Updated",
+      "type": "integer"
+    },
+    "collected_at": {
+      "format": "date-time",
+      "title": "Collected At",
+      "type": "string"
+    },
+    "station_id": {
+      "minLength": 1,
+      "title": "Station Id",
+      "type": "string"
+    },
+    "name": {
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "lat": {
+      "maximum": 90,
+      "minimum": -90,
+      "title": "Lat",
+      "type": "number"
+    },
+    "lon": {
+      "maximum": 180,
+      "minimum": -180,
+      "title": "Lon",
+      "type": "number"
+    },
+    "short_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Short Name"
+    },
+    "capacity": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Capacity"
+    },
+    "is_virtual_station": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Is Virtual Station"
+    },
+    "region_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Region Id"
+    },
+    "is_charging": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Is Charging"
+    },
+    "rental_uris": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RentalURIs"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "poll_id",
+    "last_updated",
+    "collected_at",
+    "station_id",
+    "name",
+    "lat",
+    "lon"
+  ],
+  "title": "StationInformationMessage",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
