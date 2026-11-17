@@ -2,9 +2,12 @@
 name: citibike
 
 # Config files are bind-mounted as directories, never as single files: Docker
-# Desktop on WSL keeps a single-file mount pointing at the old file once git
-# rewrites it (pull/switch/rebase), and the container then fails to start with
-# "error mounting ... no such file or directory".
+# Desktop on WSL keeps a mount pointing at the old path once git rewrites a file
+# or deletes/recreates a directory (pull/switch/rebase), and the container then
+# fails to start with "error mounting ... no such file or directory". One-shot
+# init jobs restart on every `up`, so they mount the whole ./infra directory,
+# which exists on every branch. If a long-running service hits this error after
+# a branch switch: docker compose up -d --force-recreate
 
 x-s3-env: &s3-env
   AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-citibike}
@@ -110,8 +113,8 @@ services:
       MC_CONFIG_DIR: /tmp/.mc
     networks: [citibike]
     volumes:
-      - ./infra/minio:/scripts:ro
-    entrypoint: [/bin/sh, /scripts/init_buckets.sh]
+      - ./infra:/infra:ro
+    entrypoint: [/bin/sh, /infra/minio/init_buckets.sh]
 
   catalog-volume-init:
     image: busybox:1.37.0
@@ -154,8 +157,8 @@ services:
       ICEBERG_REST_URI: http://iceberg-rest:8181
       ICEBERG_NAMESPACES: bronze silver gold
     volumes:
-      - ./infra/iceberg:/scripts:ro
-    entrypoint: [/bin/sh, /scripts/init_namespaces.sh]
+      - ./infra:/infra:ro
+    entrypoint: [/bin/sh, /infra/iceberg/init_namespaces.sh]
     networks: [citibike]
 
   kafka:
@@ -198,8 +201,8 @@ services:
       kafka: {condition: service_healthy}
     networks: [citibike]
     volumes:
-      - ./infra/kafka:/scripts:ro
-    entrypoint: [/bin/bash, /scripts/init_topics.sh]
+      - ./infra:/infra:ro
+    entrypoint: [/bin/bash, /infra/kafka/init_topics.sh]
 
   postgres:
     image: postgres:16.6-bookworm

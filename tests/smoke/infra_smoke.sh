@@ -24,6 +24,17 @@ dc()   { docker compose "$@"; }
 RUN_ID="smoke_$(date -u +%Y%m%dT%H%M%S)"
 ROWS=100
 
+# Right after `up -d`, init jobs may still be running and health checks starting.
+echo "Waiting for the stack to settle (max ${SETTLE_TIMEOUT:-180}s)..."
+deadline=$((SECONDS + ${SETTLE_TIMEOUT:-180}))
+while [ $SECONDS -lt $deadline ]; do
+  busy=$(dc ps -a --format '{{.Service}} {{.Status}}' 2>/dev/null \
+    | grep -E 'health: starting|(minio-init|kafka-init|catalog-init|catalog-volume-init) Up' || true)
+  [ -z "$busy" ] && break
+  sleep 3
+done
+[ -n "${busy:-}" ] && echo "Still not settled: $busy"
+
 step "1. Containers (INF-01)"
 for svc in minio iceberg-rest kafka postgres spark-master trino grafana; do
   cid=$(dc ps -q "$svc" 2>/dev/null)
