@@ -8,7 +8,9 @@ from uuid import uuid4
 import argparse
 import threading
 import time
+import random
 
+from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor
 from pydantic import ValidationError
 
@@ -43,8 +45,38 @@ def fetch_json(url):
         url,
         headers={"User-Agent": "citibike-student-project/0.1"},
     )
-    with urlopen(request, timeout=30) as response:
-        return json.load(response)
+    max_attempts = 3
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with urlopen(request, timeout=30) as response:
+                return json.load(response)
+
+        except HTTPError as error:
+            error.close()
+            if error.code not in {429, 500, 502, 503, 504}:
+                raise
+            if attempt == max_attempts:
+                raise
+            reason = f"HTTP {error.code}"
+
+        except (URLError, TimeoutError, ConnectionError) as error:
+            if attempt == max_attempts:
+                raise
+            reason = str(error)
+
+        max_delay = 2 ** (attempt - 1)
+        delay = random.uniform(0, max_delay)
+        logger.warning(
+            "GBFS request failed attempt=%d/%d url=%s reason=%s "
+            "retry_in=%.2fs",
+            attempt,
+            max_attempts,
+            url,
+            reason,
+            delay,
+        )
+        time.sleep(delay)
 
 
 def discover_feeds():
@@ -71,10 +103,19 @@ def poll_feed(feed_name, source_url):
         "collected_at": collected_at.isoformat(),
         "payload": payload,
     }
-    (output_dir / "raw.json").write_text(
+    raw_path = output_dir / "raw.json"
+    raw_path.write_text(
         json.dumps(raw, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+    if os.getenv("GBFS_ARCHIVE_RAW", "false").lower() == "true":
+        from ingestion.gbfs.raw_storage import upload_raw_json
+
+        archive_uri = upload_raw_json(
+            raw_path, feed_name, poll_id, collected_at
+        )
+        logger.info("Raw archived feed=%s uri=%s", feed_name, archive_uri)
 
     feed_metadata = {
         "last_updated": payload["last_updated"],
