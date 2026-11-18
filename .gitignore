@@ -1,11 +1,24 @@
-# Môi trường và file Python phát sinh
-.venv/
-__pycache__/
-*.pyc
-
-# Cấu hình riêng
+# Local secrets: copy .env.example to .env and edit; never commit .env.
 .env
+.env.*
+!.env.example
 
-# Dữ liệu và log chạy thử
-data/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# dbt
+models/dbt/target/
+models/dbt/dbt_packages/
+models/dbt/logs/
+
+# Local data / editor files
+/data/
+logs/
 *.log
+.idea/
+.vscode/
+.DS_Store
