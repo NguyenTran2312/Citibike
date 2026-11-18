@@ -4,3 +4,4 @@ pydantic==2.10.6
 kafka-python==2.2.15
 psycopg[binary]==3.2.6
 dbt-trino==1.9.3
+confluent-kafka==2.16.1

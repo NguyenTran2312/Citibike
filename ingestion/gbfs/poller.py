@@ -280,7 +280,10 @@ def main():
             os.getenv("POLL_INTERVAL_SECONDS", "60")
         ),
         "station_information": int(
-            os.getenv("GBFS_INFORMATION_INTERVAL_SECONDS", "86400")
+            os.getenv(
+                "INFORMATION_POLL_INTERVAL_SECONDS",
+                os.getenv("GBFS_INFORMATION_INTERVAL_SECONDS", "86400"),
+            )
         ),
     }
 
