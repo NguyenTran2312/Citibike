@@ -1,0 +1,110 @@
+{
+  "$defs": {
+    "VehicleTypeAvailable": {
+      "properties": {
+        "vehicle_type_id": {
+          "minLength": 1,
+          "title": "Vehicle Type Id",
+          "type": "string"
+        },
+        "count": {
+          "minimum": 0,
+          "title": "Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "vehicle_type_id",
+        "count"
+      ],
+      "title": "VehicleTypeAvailable",
+      "type": "object"
+    }
+  },
+  "description": "Message station_status chuẩn hóa.",
+  "properties": {
+    "last_updated": {
+      "minimum": 0,
+      "title": "Last Updated",
+      "type": "integer"
+    },
+    "collected_at": {
+      "format": "date-time",
+      "title": "Collected At",
+      "type": "string"
+    },
+    "poll_id": {
+      "minLength": 1,
+      "title": "Poll Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "station_id": {
+      "minLength": 1,
+      "title": "Station Id",
+      "type": "string"
+    },
+    "num_bikes_available": {
+      "minimum": 0,
+      "title": "Num Bikes Available",
+      "type": "integer"
+    },
+    "num_docks_available": {
+      "minimum": 0,
+      "title": "Num Docks Available",
+      "type": "integer"
+    },
+    "is_installed": {
+      "title": "Is Installed",
+      "type": "boolean"
+    },
+    "is_renting": {
+      "title": "Is Renting",
+      "type": "boolean"
+    },
+    "is_returning": {
+      "title": "Is Returning",
+      "type": "boolean"
+    },
+    "last_reported": {
+      "minimum": 0,
+      "title": "Last Reported",
+      "type": "integer"
+    },
+    "vehicle_types_available": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/VehicleTypeAvailable"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Vehicle Types Available"
+    }
+  },
+  "required": [
+    "last_updated",
+    "collected_at",
+    "poll_id",
+    "station_id",
+    "num_bikes_available",
+    "num_docks_available",
+    "is_installed",
+    "is_renting",
+    "is_returning",
+    "last_reported"
+  ],
+  "title": "StationStatusMessage",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
