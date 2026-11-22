@@ -365,6 +365,8 @@ services:
       GBFS_DISCOVERY_URL: https://gbfs.lyft.com/gbfs/2.3/bkn/gbfs.json
       POLL_INTERVAL_SECONDS: '60'
       INFORMATION_POLL_INTERVAL_SECONDS: '86400'
+      GBFS_PUBLISH_KAFKA: 'true'
+      GBFS_ARCHIVE_RAW: 'true'
       GBFS_STATUS_TOPIC: gbfs.station_status
       GBFS_INFORMATION_TOPIC: gbfs.station_information
       GBFS_INVALID_TOPIC: gbfs.invalid
