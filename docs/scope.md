@@ -153,7 +153,7 @@ Mỗi chuyến đi có 13 trường:
 - **LOW_BIKES:** Số xe lớn hơn 0 nhưng nhỏ hơn hoặc bằng threshold.
 - **EMPTY:** Số xe bằng 0 và trạm vẫn cho thuê.
 - **UNAVAILABLE:** Trạm không hoạt động hoặc không cho thuê/trả xe theo các cờ trạng thái.
-- **STALE:** `collected_at - last_reported` vượt ngưỡng quy định.
+- **STALE:** Thời gian hiện tại trừ `last_reported` vượt ngưỡng quy định (thống nhất với Slide 9–10).
 - **NORMAL:** Trạm hoạt động, dữ liệu đủ mới và số xe vượt threshold.
 
 **Threshold mặc định đề xuất:** 2 xe, có thể cấu hình.
@@ -371,10 +371,12 @@ PostgreSQL được cập nhật trực tiếp từ Kafka thông qua **Latest St
 
 ### Phân công 4 thành viên
 
-- **Thành viên 1:** Batch ingestion và Trip History processing.
-- **Thành viên 2:** GBFS Poller, Kafka và Spark Streaming.
-- **Thành viên 3:** Iceberg, dbt, Data Modeling và Station Bridge.
-- **Thành viên 4:** Docker Compose, Trino, Grafana và Airflow.
+- **Khang:** Batch ingestion và Trip History processing.
+- **Quan:** GBFS Poller, Kafka Producer, Latest State Consumer, PostgreSQL serving và cảnh báo.
+- **Kien:** Data Modeling, dbt, Station Bridge và Grafana dashboard.
+- **Nguyen:** Docker Compose và hạ tầng, Trino, Airflow, Spark Streaming → Iceberg.
+
+Danh sách issue của từng người nằm trong `docs/contracts.md` mục 4.
 
 Tất cả thành viên cùng tham gia integration tests, tài liệu và chạy end-to-end.
 

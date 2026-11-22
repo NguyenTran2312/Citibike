@@ -1,6 +1,6 @@
 # Hạ tầng Citi Bike (local Docker Compose)
 
-Stack phát triển trên một máy: Kafka KRaft 3.9.1 (1 broker), Spark 3.5.6 + Iceberg 1.9.2, Iceberg REST Catalog, MinIO, PostgreSQL 16.6, Trino 484 và Grafana 12.3. Airflow 2.10.5 nằm ở profile riêng `airflow` (INF-09, bật khi cần).
+Stack phát triển trên một máy: Kafka KRaft 3.9.1 (1 broker), Spark 3.5.6 + Iceberg 1.9.2, Iceberg REST Catalog, MinIO, PostgreSQL 16.6, Trino 484 và Grafana 12.3. Airflow 2.10.5 nằm ở profile riêng `airflow` (INF-03, bật khi cần).
 
 Mọi lệnh dưới đây chạy ở thư mục gốc repo, trong shell bash (WSL/Linux/macOS). Trên PowerShell, các lệnh `docker compose` giữ nguyên, chỉ thay `cp` bằng `Copy-Item`.
 
@@ -34,7 +34,7 @@ Smoke test in `[PASS]/[FAIL]` cho từng hạng mục và kết thúc bằng `Sm
 | Iceberg REST | Catalog dùng chung cho Spark và Trino; namespace `bronze`, `silver`, `gold` | http://localhost:8181/v1/config | `http://iceberg-rest:8181` |
 | Kafka | Topic `gbfs.station_status`, `gbfs.station_information`, `gbfs.invalid` (3 partition, RF 1, giữ 7 ngày) | `localhost:9092` | `kafka:29092` |
 | Spark master / worker | Cluster standalone, worker 2 core / 4 GB | UI http://localhost:8081, http://localhost:8082 | `spark://spark-master:7077` |
-| PostgreSQL | DB `citibike`: `station_status_latest`, `active_alerts` | `localhost:5432` | `postgres:5432` |
+| PostgreSQL | DB `citibike`: `station_status_latest`, `active_alerts` (schema và quy tắc: `docs/contracts.md` mục 1.7) | `localhost:5432` | `postgres:5432` |
 | Trino | SQL trên Iceberg, catalog `iceberg` | http://localhost:8080 | `http://trino:8080` |
 | Grafana | Datasource PostgreSQL + Trino provision sẵn | http://localhost:3000 | `http://grafana:3000` |
 | Airflow (profile `airflow`) | Scheduler, webserver, metadata DB riêng | http://localhost:8083 | - |
@@ -55,9 +55,9 @@ Quy ước bảng: Spark dùng catalog `lakehouse` (catalog mặc định) nên 
 
 ## 3. Lệnh cho từng thành viên
 
-Các entry point dưới đây đã khai báo trong Compose (env, volume, dependency). Chúng chỉ chạy được khi module ứng dụng tương ứng đã được viết; nếu chưa có file, container sẽ báo lỗi thiếu module/file.
+Người phụ trách và issue theo `docs/contracts.md` mục 4. Các entry point dưới đây đã khai báo trong Compose (env, volume, dependency). Chúng chỉ chạy được khi module ứng dụng tương ứng đã được viết; nếu chưa có file, container sẽ báo lỗi thiếu module/file.
 
-**Khang (Batch)**: cần `ingestion/trip_history/downloader.py`, `batch/jobs/trips_bronze.py`, `batch/jobs/trips_silver.py`:
+**Khang (Batch, BAT-01..12)**: cần `ingestion/trip_history/downloader.py`, `batch/jobs/trips_bronze.py`, `batch/jobs/trips_silver.py`:
 
 ```bash
 docker compose --profile tools run --rm trip-downloader
@@ -65,19 +65,19 @@ docker compose --profile tools run --rm spark-batch
 docker compose --profile tools run --rm spark-batch-silver
 ```
 
-**Quan (Streaming ingestion)**: cần `ingestion/gbfs/poller.py`, `serving/latest_state_consumer.py`:
+**Quan (GBFS ingestion & PostgreSQL serving, STR-01..06, STR-05b)**: cần `ingestion/gbfs/poller.py`, `serving/latest_state_consumer.py`; chi tiết poller trong `ingestion/gbfs/README.md` (có sau khi PR #1 merge):
 
 ```bash
 docker compose --profile pipeline up -d --build gbfs-poller latest-state-consumer
 ```
 
-**Nguyen (Spark Streaming)**: `streaming/jobs/gbfs_history.py`:
+**Nguyen (Spark Streaming, STR-07..12)**: `streaming/jobs/gbfs_history.py`:
 
 ```bash
 docker compose --profile pipeline up -d spark-streaming
 ```
 
-**Kien (dbt)**: cần `models/dbt/dbt_project.yml` với `profile: citibike`:
+**Kien (dbt và Grafana, MOD-01/02, VIS-01)**: cần `models/dbt/dbt_project.yml` với `profile: citibike`:
 
 ```bash
 docker compose --profile tools run --rm dbt debug --profiles-dir /app/profiles
@@ -131,8 +131,8 @@ docker compose down -v              # XÓA toàn bộ dữ liệu (MinIO, Kafka,
 - **MinIO** dùng bản build Bitnami legacy vì image `minio/minio` không còn tải được; phiên bản không đổi so với cấu hình ban đầu.
 - **Spark**: driver và executor dùng chung image [spark/Dockerfile](spark/Dockerfile), cùng `PYTHONPATH=/opt/project` và các mount `batch/`, `streaming/`, `tests/`. `spark.cores.max=1` để batch và streaming chia sẻ worker 2 core.
 - **Build image**: mỗi image chỉ do một service build (`spark-master` cho `citibike/spark`, `gbfs-poller`/các tool một lần cho `citibike/python`), các service khác dùng lại với `pull_policy: never`. Nếu nhiều service cùng build một tag, Compose gắn nhãn tên service vào image nên các bản build ghi đè nhau và mỗi lần `up -d --build` sẽ tạo lại container (làm đứt job streaming). Vì vậy các service profile `tools`/`pipeline` dùng image Spark cần stack mặc định đã được `up` ít nhất một lần.
-- **Airflow** (INF-09) chưa có DAG; bật bằng `docker compose --profile airflow up -d`. DAG đặt trong `infra/airflow/dags/`.
-- **Grafana/dbt** (INF-06): datasource và profile đã có; dashboard JSON đặt trong `infra/grafana/dashboards/`.
+- **Airflow** (INF-03) chưa có DAG; bật bằng `docker compose --profile airflow up -d`. DAG đặt trong `infra/airflow/dags/`.
+- **Grafana/dbt** (hạ tầng cho MOD-01 và VIS-01): datasource và profile đã có; dashboard JSON (Kien) đặt trong `infra/grafana/dashboards/`.
 
 ## Tài liệu tham chiếu
 
