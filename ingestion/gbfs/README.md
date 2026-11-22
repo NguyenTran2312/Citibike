@@ -144,10 +144,14 @@ Message lỗi không được có trường ngoài schema đã định nghĩa.
 
 1. Gọi API (có retry), ghi nhận `collected_at`.
 2. Ghi `raw.json` vào thư mục đầu ra trên máy.
-3. Nếu `GBFS_ARCHIVE_RAW=true`: upload `raw.json` lên MinIO.
-4. Validate từng trạm, ghi `valid.jsonl` và `invalid.jsonl`.
-5. Nếu `GBFS_PUBLISH_KAFKA=true`: gửi message vào Kafka,
+3. Validate từng trạm, ghi `valid.jsonl` và `invalid.jsonl`.
+4. Nếu `GBFS_PUBLISH_KAFKA=true`: gửi message vào Kafka,
    chờ broker xác nhận rồi ghi `kafka_delivery.json`.
+5. Nếu `GBFS_ARCHIVE_RAW=true`: upload `raw.json` lên MinIO.
+   Bước này chạy sau Kafka và chạy cả khi bước 3–4 lỗi;
+   MinIO lỗi chỉ được log, không làm lần polling thất bại.
+6. Nếu đã bật gửi Kafka và không đặt `GBFS_KEEP_LOCAL=true`:
+   xóa thư mục đầu ra của lần polling.
 
 ### Biến cấu hình
 
@@ -158,6 +162,8 @@ Message lỗi không được có trường ngoài schema đã định nghĩa.
 | `INFORMATION_POLL_INTERVAL_SECONDS` | `86400` | Chu kỳ `station_information`; nếu không đặt, dùng `GBFS_INFORMATION_INTERVAL_SECONDS` |
 | `GBFS_PUBLISH_KAFKA` | `false` | Gửi message vào Kafka |
 | `GBFS_ARCHIVE_RAW` | `false` | Upload `raw.json` lên MinIO |
+| `GBFS_DATA_DIR` | `data/gbfs` | Thư mục đầu ra trên máy |
+| `GBFS_KEEP_LOCAL` | `false` | Giữ thư mục đầu ra sau khi đã gửi Kafka (để đối soát) |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka broker |
 | `GBFS_STATUS_TOPIC` | `gbfs.station_status` | Topic status |
 | `GBFS_INFORMATION_TOPIC` | `gbfs.station_information` | Topic information |
@@ -201,8 +207,8 @@ Dừng poller:
 docker compose --profile pipeline stop gbfs-poller
 ```
 
-File đầu ra trong container nằm ở `/app/data/gbfs/`,
-không được mount ra máy host.
+File đầu ra trong container nằm ở `/app/data/gbfs/`, không được mount
+ra máy host và bị xóa sau mỗi lần polling (xem `GBFS_KEEP_LOCAL`).
 
 ### Cách 2 — Trên máy host, chỉ ghi file
 
@@ -244,8 +250,10 @@ Bỏ `--once` để chạy liên tục, hoặc dùng `--duration <giây>`.
 
 ### Dừng chương trình
 
-Ở chế độ liên tục, nhấn Ctrl+C để yêu cầu dừng. Nếu đang gọi API
-hoặc gửi Kafka, chương trình chờ lần polling đó kết thúc.
+Ở chế độ liên tục, nhấn Ctrl+C hoặc gửi SIGTERM (`docker stop`)
+để yêu cầu dừng. Nếu đang gọi API hoặc gửi Kafka, chương trình chờ
+lần polling đó kết thúc. Compose cho poller tối đa 60 giây
+(`stop_grace_period`) trước khi buộc dừng.
 
 ## Đầu ra trên máy
 
@@ -261,13 +269,15 @@ Mỗi lần thu thập lưu tại:
 | `kafka_delivery.json` | Số message broker đã xác nhận, chỉ có khi gửi Kafka thành công |
 
 Thư mục `data/` không được commit lên GitHub.
-Mỗi lần polling `station_status` chiếm khoảng 2,8 MB;
-chương trình chưa tự dọn các thư mục cũ.
+Mỗi lần polling `station_status` chiếm khoảng 2,8 MB. Khi gửi Kafka,
+thư mục được xóa ngay sau lần polling (kể cả khi lỗi) trừ khi đặt
+`GBFS_KEEP_LOCAL=true`; khi không gửi Kafka, file được giữ lại.
 
 ## Lưu raw JSON lên MinIO (STR-04)
 
-Bật bằng `GBFS_ARCHIVE_RAW=true`. Sau khi ghi `raw.json` trên máy,
-poller upload chính file đó lên:
+Bật bằng `GBFS_ARCHIVE_RAW=true`. Sau bước gửi Kafka, poller upload
+`raw.json` lên địa chỉ dưới đây. Upload là best-effort: nếu MinIO lỗi,
+log ghi `Raw archive thất bại` và dữ liệu vẫn đi vào Kafka.
 
 ```text
 s3://<RAW_BUCKET>/gbfs/<feed_name>/date=<YYYY-MM-DD>/<poll_id>/raw.json
@@ -343,7 +353,8 @@ Nó không chứng minh consumer phía sau đã xử lý thành công.
 
 ### Đối soát dữ liệu
 
-Thay đường dẫn dưới đây bằng thư mục polling cần kiểm tra:
+Chạy poller với `GBFS_KEEP_LOCAL=true` để giữ thư mục polling,
+rồi thay đường dẫn dưới đây bằng thư mục cần kiểm tra:
 
 ```bash
 python tests/integration/check_kafka_delivery.py data/gbfs/station_status/<poll_id>
@@ -364,10 +375,12 @@ Status được nhận diện bằng poll_id; information bằng collected_at.
 python -m unittest discover -s tests/unit -p "test_gbfs*.py" -v
 ```
 
-Kết quả đã ghi nhận: 32 tests thành công.
+Kết quả đã ghi nhận: 49 tests thành công
+(cần thêm `psycopg[binary]` cho test của consumer).
 
-Các test kiểm tra schema, logic vòng polling, retry khi gọi API
-và producer với Kafka client giả lập.
+Các test kiểm tra schema, logic vòng polling, retry khi gọi API,
+producer với Kafka client giả lập, thứ tự Kafka → MinIO, dọn file
+tạm, SIGTERM và cách Latest State Consumer cách ly message hỏng.
 
 Chu kỳ 24 giờ được kiểm tra phép tính thời gian bằng đồng hồ giả;
 chưa chạy kiểm thử thực tế kéo dài 24 giờ.
@@ -384,15 +397,14 @@ Các file được tạo trong `ingestion/gbfs/json_schemas/`.
 
 ## Hạn chế đã biết
 
-- Nếu upload MinIO thất bại, cả lần polling dừng trước bước
-  validate và gửi Kafka.
 - Nếu gửi Kafka thất bại giữa chừng, một phần message có thể đã được ghi;
   chưa có cơ chế tự replay thư mục polling cũ hoặc bảo đảm
   exactly-once cho toàn bộ pipeline.
-- Chưa xử lý SIGTERM: `docker stop` có thể cắt ngang lần polling
-  đang chạy.
+- Nếu poller bị buộc dừng (SIGKILL, hết `stop_grace_period`),
+  lần polling đang chạy bị mất; lần sau cập nhật lại trạng thái mới nhất,
+  lịch sử thiếu một observation. Không có cơ chế replay thư mục cũ.
+- Nếu MinIO lỗi, raw của lần polling đó không được lưu và không upload bù.
 - Khi hết số lần retry, lỗi chỉ được ghi log, chưa phát alert.
-- Thư mục đầu ra trên máy và trong container chưa được tự dọn.
 - Chưa có unit test cho `raw_storage.py`.
 
 ## Các mục cần hoàn thiện

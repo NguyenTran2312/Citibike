@@ -9,6 +9,8 @@ import argparse
 import threading
 import time
 import random
+import shutil
+import signal
 
 from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor
@@ -87,13 +89,19 @@ def discover_feeds():
     }
 
 
+def _enabled(name):
+    return os.getenv(name, "false").lower() == "true"
+
+
 def poll_feed(feed_name, source_url):
     # Mỗi lần gọi cho một feed có mã riêng.
     poll_id = f"{feed_name}-{uuid4()}"
     payload = fetch_json(source_url)
     collected_at = utc_now()
 
-    output_dir = Path("data/gbfs") / feed_name / poll_id
+    output_dir = (
+        Path(os.getenv("GBFS_DATA_DIR", "data/gbfs")) / feed_name / poll_id
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Lưu nguồn trước khi kiểm tra dữ liệu.
@@ -109,14 +117,28 @@ def poll_feed(feed_name, source_url):
         encoding="utf-8",
     )
 
-    if os.getenv("GBFS_ARCHIVE_RAW", "false").lower() == "true":
-        from ingestion.gbfs.raw_storage import upload_raw_json
+    publish_enabled = _enabled("GBFS_PUBLISH_KAFKA")
 
-        archive_uri = upload_raw_json(
-            raw_path, feed_name, poll_id, collected_at
-        )
-        logger.info("Raw archived feed=%s uri=%s", feed_name, archive_uri)
+    try:
+        write_messages(feed_name, payload, poll_id, collected_at, output_dir)
 
+        if publish_enabled:
+            publish_to_kafka(feed_name, poll_id, output_dir)
+    finally:
+        # Raw được lưu sau Kafka và cả khi bước trên lỗi (ví dụ feed sai
+        # cấu trúc), để MinIO không chặn dữ liệu realtime.
+        if _enabled("GBFS_ARCHIVE_RAW"):
+            archive_raw(raw_path, feed_name, poll_id, collected_at)
+
+        # Khi đã gửi Kafka, file trên máy chỉ là bản tạm: xóa để không
+        # đầy đĩa. Giữ lại bằng GBFS_KEEP_LOCAL=true khi cần đối soát.
+        if publish_enabled and not _enabled("GBFS_KEEP_LOCAL"):
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    return output_dir
+
+
+def write_messages(feed_name, payload, poll_id, collected_at, output_dir):
     feed_metadata = {
         "last_updated": payload["last_updated"],
         "collected_at": collected_at,
@@ -185,38 +207,50 @@ def poll_feed(feed_name, source_url):
     )
     logger.info("output=%s", output_dir)
 
-    publish_enabled = os.getenv(
-        "GBFS_PUBLISH_KAFKA",
-        "false",
-    ).lower() == "true"
 
-    if publish_enabled:
-        from ingestion.gbfs.producer import publish_poll_output
+def publish_to_kafka(feed_name, poll_id, output_dir):
+    from ingestion.gbfs.producer import publish_poll_output
 
-        confirmed = publish_poll_output(feed_name, output_dir)
+    confirmed = publish_poll_output(feed_name, output_dir)
 
-        # Chỉ ghi xác nhận sau khi Kafka đã xác nhận toàn bộ.
-        (output_dir / "kafka_delivery.json").write_text(
-            json.dumps(
-                {
-                    "feed_name": feed_name,
-                    "poll_id": poll_id,
-                    "confirmed": confirmed,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+    # Chỉ ghi xác nhận sau khi Kafka đã xác nhận toàn bộ.
+    (output_dir / "kafka_delivery.json").write_text(
+        json.dumps(
+            {
+                "feed_name": feed_name,
+                "poll_id": poll_id,
+                "confirmed": confirmed,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    logger.info(
+        "Kafka confirmed feed=%s poll_id=%s counts=%s",
+        feed_name,
+        poll_id,
+        confirmed,
+    )
+
+
+def archive_raw(raw_path, feed_name, poll_id, collected_at):
+    # Best-effort: MinIO lỗi chỉ được log, không làm lần polling thất bại.
+    try:
+        from ingestion.gbfs.raw_storage import upload_raw_json
+
+        archive_uri = upload_raw_json(
+            raw_path, feed_name, poll_id, collected_at
         )
-
-        logger.info(
-            "Kafka confirmed feed=%s poll_id=%s counts=%s",
-            feed_name,
-            poll_id,
-            confirmed,
+    except Exception:
+        logger.exception(
+            "Raw archive thất bại feed=%s poll_id=%s", feed_name, poll_id
         )
+        return None
 
-    return output_dir
+    logger.info("Raw archived feed=%s uri=%s", feed_name, archive_uri)
+    return archive_uri
 
 
 def run_feed_loop(feed_name, source_url, interval, stop_event):
@@ -245,6 +279,19 @@ def run_feed_loop(feed_name, source_url, interval, stop_event):
             break
 
     logger.info("Đã dừng lịch feed=%s", feed_name)
+
+
+def install_stop_handler(stop_event):
+    # docker stop gửi SIGTERM: dừng sau khi lần polling đang chạy
+    # (kể cả bước flush Kafka) kết thúc, giống Ctrl+C.
+    def request_stop(signum, frame):
+        logger.info(
+            "Nhận %s, dừng sau lần polling hiện tại",
+            signal.Signals(signum).name,
+        )
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
 
 
 def main():
@@ -291,6 +338,7 @@ def main():
         raise ValueError("Chu kỳ polling phải lớn hơn 0")
 
     stop_event = threading.Event()
+    install_stop_handler(stop_event)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [

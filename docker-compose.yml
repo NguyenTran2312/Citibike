@@ -388,6 +388,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_GROUP_ID: citibike-postgres-latest
       GBFS_STATUS_TOPIC: gbfs.station_status
+      GBFS_INVALID_TOPIC: gbfs.invalid
       PGHOST: postgres
       PGPORT: '5432'
       PGDATABASE: citibike
