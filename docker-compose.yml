@@ -357,7 +357,9 @@ services:
     build: *python-build
     pull_policy: build
     profiles: [pipeline]
-    restart: on-failure:5
+    restart: unless-stopped
+    # Room for the in-flight poll and its Kafka flush (up to 35 s) once the poller handles SIGTERM.
+    stop_grace_period: 60s
     command: [python, -m, ingestion.gbfs.poller]
     environment:
       <<: *s3-env
@@ -377,7 +379,9 @@ services:
   latest-state-consumer:
     <<: *app
     profiles: [pipeline]
-    restart: on-failure:5
+    # Fail fast and let Docker restart with backoff (100 ms doubling, capped at 1 min). Offsets are
+    # committed only after the PostgreSQL write, so a restart replays into an idempotent UPSERT.
+    restart: unless-stopped
     command: [python, -m, serving.latest_state_consumer]
     environment:
       TZ: UTC
