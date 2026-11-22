@@ -108,12 +108,12 @@
 
 **Phối hợp:** Quan (Streaming) và Kien (Schema / Data Quality).
 
-**Ví dụ message chuẩn hóa được nhóm đề xuất** (chưa xác nhận toàn bộ feed fields chính thức):
+**Ví dụ message chuẩn hóa trên topic `gbfs.station_status`** (tập trường hiện tại; giữ thêm trường nguồn là quyết định còn mở, xem mục 5):
 
 ```json
 {
   "schema_version": 1,
-  "poll_id": "poll-20261116T024000Z",
+  "poll_id": "station_status-3f2b8c1e-5d7a-4e0b-9c61-2a4f0e8d9b17",
   "station_id": "abc",
   "num_bikes_available": 5,
   "num_docks_available": 12,
@@ -126,7 +126,14 @@
 }
 ```
 
-**Iceberg table:** `gbfs_status` (tên namespace cụ thể cần xác nhận khi code).
+**Schema hiện thực:** Pydantic `ingestion/gbfs/schemas.py`, xuất ra `ingestion/gbfs/json_schemas/station_status.schema.json` (có trên `main` sau khi PR #1 merge). Khi schema đổi, sửa mục này trong cùng PR.
+
+- `poll_id`: `station_status-<uuid4>`, mỗi lần polling một giá trị, không dùng chung với `station_information`.
+- `last_updated`: metadata cấp feed (epoch giây); `last_reported`: của từng trạm (epoch giây); `collected_at`: thời điểm poller nhận phản hồi, UTC có timezone.
+- Cờ `is_*` nhận 0/1 hoặc boolean từ nguồn, xuất ra boolean.
+- `vehicle_types_available`: array hoặc `null`.
+
+**Iceberg table:** `silver.gbfs_status` (scope Slide 10).
 
 **Grain / khóa logic:** `(station_id, poll_id)`.
 
@@ -134,11 +141,9 @@
 
 - Lưu observation cho từng lần polling khác nhau, **kể cả khi trạng thái không đổi**.
 - Nếu retry phát lại **cùng `(station_id, poll_id)`**, dedup để chỉ còn một observation logic.
-- Dự kiến giữ **toàn bộ trường của `station_status`** trong schema đã xác minh; danh sách đầy đủ các feed fields vẫn **Pending**.
+- Message Kafka hiện chỉ chứa tập trường đã chuẩn hóa ở trên; các trường nguồn khác (ví dụ `num_bikes_disabled`, `num_docks_disabled`, `num_ebikes_available`) chỉ có trong raw JSON (mục 2.3.5). Giữ thêm trường nào trong message là **Pending** (mục 5), phải chốt trước STR-07.
 - Spark jobs phải xử lý dedup và có Data Quality tests kiểm chứng.
-- **Đề xuất:** Nếu `num_bikes_available = NULL`, reject message hoặc đưa vào luồng invalid; chính sách cuối cùng chưa chốt.
-
-> `last_updated` trong ví dụ hiện được giữ đúng tên từ ghi chú. Cần xác minh vị trí metadata cấp feed và quy tắc chuẩn hóa trước khi khóa JSON Schema chính thức.
+- `num_bikes_available = NULL`: hiện thực đang **reject** (ghi vào `gbfs.invalid`); chờ Kien xác nhận (mục 5).
 
 ### 1.5. GBFS — `station_information`
 
@@ -153,14 +158,63 @@
 | `capacity` | Sức chứa trạm | Nullable |
 | `is_virtual_station` | Phân biệt trạm ảo/vật lý | Nullable |
 
-**Polling:** Mỗi **24 giờ**; `poll_id` của `station_information` **không dùng chung** với `station_status`.
+Message trên topic `gbfs.station_information` gồm các trường trên cùng `last_updated` và `collected_at` (schema: `ingestion/gbfs/json_schemas/station_information.schema.json`, có trên `main` sau khi PR #1 merge). Các trường nguồn khác (ví dụ `region_id`, `rental_uris`, `is_charging`) chỉ có trong raw JSON.
 
-**Pending:** Danh sách đầy đủ field từ GBFS v2.3, chính sách snapshot/grain của bảng thông tin trạm, và lịch refresh nếu metadata thay đổi giữa hai lần poll.
+**Iceberg table:** `silver.gbfs_station_information` (scope Slide 10).
+
+**Polling:** Mỗi **24 giờ**; `poll_id` của `station_information` (`station_information-<uuid4>`) **không dùng chung** với `station_status`. Hiện `poll_id` này chỉ dùng cho đường dẫn raw trên MinIO, **chưa có trong message**; một snapshot được nhận diện bằng `collected_at`.
+
+**Pending (mục 5):** Danh sách field giữ trong message (STR-10 yêu cầu giữ đầy đủ), có xuất `poll_id` vào message hay không, chính sách snapshot/grain của bảng thông tin trạm, và lịch refresh nếu metadata thay đổi giữa hai lần poll.
 
 ### 1.6. Gold metrics và station mapping
 
 - **Gold:** Chốt **grain của từng metric** trước khi viết SQL; công thức và số liệu phải đối chiếu với **fixture mẫu**.
 - **Station mapping:** Kien mở issue nghiên cứu riêng; chưa tự coi các quy tắc mapping là đã hoàn tất.
+
+### 1.7. PostgreSQL serving — `station_status_latest` và `active_alerts`
+
+**Phụ trách:** Quan (ghi dữ liệu: STR-05 #7, STR-05b #39); Kien (đọc trên Grafana: VIS-01 #31). **Schema:** `infra/postgres/init.sql` (Nguyen).
+
+PostgreSQL được cập nhật trực tiếp bởi Latest State Consumer đọc `gbfs.station_status`, không dùng CDC (scope Slide 7, 10).
+
+#### `station_status_latest`
+
+**Grain:** `1 dòng = trạng thái mới nhất của 1 station_id` (khóa chính `station_id`).
+
+| Cột | Kiểu | Nguồn |
+|---|---|---|
+| `station_id` | `TEXT` PK | message |
+| `poll_id` | `TEXT NOT NULL` | message |
+| `num_bikes_available` | `INTEGER NOT NULL`, ≥ 0 | message |
+| `num_docks_available` | `INTEGER`, ≥ 0 | message |
+| `is_installed`, `is_renting`, `is_returning` | `BOOLEAN NOT NULL` | message |
+| `last_updated`, `last_reported` | `TIMESTAMPTZ` | epoch giây trong message, đổi bằng `to_timestamp` |
+| `collected_at` | `TIMESTAMPTZ NOT NULL` | message |
+
+**Quy tắc:** UPSERT chỉ ghi đè khi `collected_at` của message **mới hơn** dòng hiện có; message cũ hoặc replay cùng `collected_at` không thay đổi dòng. Thứ tự commit và offset xem mục 2.3.4.
+
+#### `active_alerts`
+
+**Grain:** `1 dòng = 1 cảnh báo đang mở của 1 trạm` (khóa chính `(station_id, alert_type)`); trạm không có dòng nào được coi là `NORMAL`.
+
+| Cột | Kiểu |
+|---|---|
+| `station_id` | `TEXT NOT NULL`, tham chiếu `station_status_latest` |
+| `alert_type` | `LOW_BIKES` \| `EMPTY` \| `UNAVAILABLE` \| `STALE` |
+| `opened_at` | `TIMESTAMPTZ NOT NULL`, giữ nguyên khi cảnh báo còn mở |
+| `updated_at` | `TIMESTAMPTZ NOT NULL` |
+
+| Cảnh báo | Điều kiện (scope Slide 6) | Cập nhật khi |
+|---|---|---|
+| `LOW_BIKES` | `0 < num_bikes_available <= LOW_BIKES_THRESHOLD` | Consumer ghi một observation mới hơn |
+| `EMPTY` | `num_bikes_available = 0` và `is_renting = true` | Consumer ghi một observation mới hơn |
+| `UNAVAILABLE` | Trạm không hoạt động hoặc không cho thuê/trả theo cờ `is_*` (điều kiện chính xác: **Pending**, mục 5) | Consumer ghi một observation mới hơn |
+| `STALE` | `now() - last_reported > STALE_AFTER_SECONDS` | Job định kỳ, chạy cả khi không có message mới |
+
+- **Ngưỡng:** `LOW_BIKES_THRESHOLD` (mặc định 2) và `STALE_AFTER_SECONDS` (mặc định 180), đặt trong `.env.example` / `docker-compose.yml`.
+- **Staleness** luôn tính từ thời gian hiện tại và `last_reported`, không dùng `collected_at`.
+- Cảnh báo theo message được mở/đóng trong cùng transaction với UPSERT, trước khi commit Kafka offset; replay không được đổi `opened_at` hay tạo dòng trùng.
+- Chi tiết hiện thực và tiêu chí nghiệm thu: issue #39.
 
 ---
 
@@ -256,7 +310,9 @@ Downloader → MinIO (S3) → Spark Bronze → Spark Silver → Iceberg → Trin
 - **Số broker local trong ghi chú:** `1`.
 - **Replication factor local:** `1`.
 - **Trade-off:** Tiết kiệm tài nguyên nhưng khả năng chịu lỗi kém hơn HA cluster.
-- **Partitions:** **Đề xuất 3 partitions/topic**, chưa chốt; phải thử nghiệm để chọn cấu hình phù hợp.
+- **Partitions:** Đã hiện thực **3 partitions/topic** trong `infra/kafka/init_topics.sh`; con số cuối cùng vẫn chờ benchmark (mục 5).
+- **Retention:** 7 ngày (`retention.ms=604800000`), `cleanup.policy=delete`.
+- **Message key:** `station_id` cho cả `gbfs.station_status` và `gbfs.station_information`; message trên `gbfs.invalid` dùng `station_id` nếu payload có, ngược lại để key rỗng.
 
 **Ba Kafka topics:**
 
@@ -310,8 +366,8 @@ Downloader → MinIO (S3) → Spark Bronze → Spark Silver → Iceberg → Trin
 
 **Python Consumer → PostgreSQL**
 
-- Cần chốt rõ thời điểm **commit Kafka offset**.
-- Dùng `UPSERT` thay vì `INSERT` để chịu được message replay.
+- **Commit Kafka offset** (đã chốt trong STR-05): tắt auto-commit; chỉ commit offset của message sau khi transaction PostgreSQL của message đó đã commit.
+- Dùng `UPSERT` thay vì `INSERT` để chịu được message replay (quy tắc ở mục 1.7).
 - Nếu đã ghi PostgreSQL nhưng crash trước khi commit offset: sau restart có thể đọc lại; `UPSERT` phải idempotent.
 - Nếu PostgreSQL mất kết nối từ 2 phút trở lên: **đề xuất** exponential backoff, delay tối đa **45 giây**, có jitter; **không commit offset** của record chưa ghi thành công.
 
@@ -323,6 +379,24 @@ Downloader → MinIO (S3) → Spark Bronze → Spark Silver → Iceberg → Trin
   - History của `station_information`.
 - Spark có consumer group phục vụ query; cần chốt/cấu hình chính xác trong implementation, không dùng checkpoint chung cho hai queries.
 - Việc commit offset/checkpoint và ghi Iceberg phải được kiểm thử trong tình huống crash/replay.
+
+#### 2.3.5. Raw GBFS trên MinIO
+
+Poller lưu toàn bộ phản hồi của mỗi lần polling (scope Slide 7, 9 — STR-04):
+
+```text
+s3://raw/gbfs/<feed_name>/date=<YYYY-MM-DD>/<poll_id>/raw.json
+```
+
+| Trường trong `raw.json` | Ý nghĩa |
+|---|---|
+| `poll_id` | Mã lần polling (mục 1.4, 1.5) |
+| `source_url` | URL feed đã gọi |
+| `collected_at` | Thời điểm nhận phản hồi, UTC; `date=` lấy theo giá trị này |
+| `payload` | JSON nguồn nguyên vẹn, gồm cả các trường không có trong message Kafka |
+
+- Bật bằng `GBFS_ARCHIVE_RAW=true` (đã bật cho service `gbfs-poller` trong Compose); bucket lấy từ `RAW_BUCKET`.
+- Đây là nguồn để kiểm tra và xử lý lại khi cần các trường nguồn không có trong message Kafka.
 
 ### 2.4. Fault tolerance — Spark → Iceberg
 
@@ -377,14 +451,38 @@ CI ban đầu gồm đúng **ba nhóm kiểm tra**:
 
 ## 4. Phân công và phụ thuộc giữa các thành viên
 
-| Người phụ trách | Công việc bắt đầu | Contract cần phối hợp |
-|---|---|---|
-| **Khang — Batch** | Downloader + manifest trước; không phụ thuộc Streaming | Với **Kien**: `silver.trips`, timezone, dedup và quality rules. Với **Nguyen**: entry points, raw storage và runtime. |
-| **Quan — Streaming** | JSON Schema + Poller prototype, sau đó Kafka Producer | Với **Kien**: GBFS message schema, Iceberg observation grain và PostgreSQL latest-state semantics. Với **Nguyen**: Kafka/Spark runtime, checkpoint, recovery. |
-| **Kien — Data Modeling** | Hoàn thiện schema contracts cùng fixtures; mở issue riêng nghiên cứu station mapping | Review schemas và data-quality rules với Khang/Quan. |
-| **Nguyen — Infrastructure** | MinIO, Kafka, Spark, Catalog smoke tests; CI cơ bản | Review runtime contracts, kết nối hệ thống và Airflow job-launch. |
+Bảng này là nguồn chuẩn về người phụ trách; `docs/scope.md` Slide 12 và `infra/README.md` mục 3 phải khớp với bảng này.
+
+| Người phụ trách | Phạm vi | Issue | Contract cần phối hợp |
+|---|---|---|---|
+| **Khang — Batch** | Downloader, manifest, Spark Bronze/Silver cho Trip History | BAT-01..BAT-12 (#15–#26, issue cha #28) | Với **Kien**: `silver.trips`, timezone, dedup và quality rules. Với **Nguyen**: entry points, raw storage và runtime. |
+| **Quan — GBFS Ingestion & PostgreSQL serving** | Poller, Kafka Producer, raw GBFS trên MinIO, Latest State Consumer, `station_status_latest`, `active_alerts` | STR-01..STR-06 (#2, #4–#8), STR-05b (#39) | Với **Kien**: GBFS message schema, Iceberg observation grain, PostgreSQL latest-state và quy tắc cảnh báo. Với **Nguyen**: Kafka runtime, schema message cho Spark, recovery. |
+| **Kien — Data Modeling & Dashboard** | dbt Gold, station mapping, Grafana dashboard | MOD-01 (#29), MOD-02 (#30), VIS-01 (#31) | Review schemas và data-quality rules với Khang/Quan. |
+| **Nguyen — Infrastructure & Spark Streaming** | Docker Compose, MinIO, Kafka, Spark, Catalog, Trino, CI, Airflow, HA; Spark Streaming → Iceberg | INF-01..INF-04 (#32–#35), STR-07..STR-12 (#9–#14) | Review runtime contracts, kết nối hệ thống và Airflow job-launch. Với **Quan**: schema message Kafka (mục 1.4, 1.5). |
+| **Cả nhóm** | Tích hợp end-to-end và demo | INT-01 (#36) | Mục 3. |
 
 **Nguyên tắc tích hợp:** Batch và Streaming có thể phát triển song song, nhưng giao diện dữ liệu ở ranh giới producer/consumer phải được thống nhất trước khi tích hợp.
+
+### 4.1. Truy vết scope → contract → issue
+
+Mỗi sản phẩm bàn giao trong `docs/scope.md` Slide 13 phải có ít nhất một issue. Dòng **Chưa có issue** là việc còn thiếu trong kế hoạch.
+
+| Sản phẩm bàn giao / yêu cầu trong scope | Mục contract | Issue |
+|---|---|---|
+| Repository có cấu trúc rõ ràng và hướng dẫn triển khai | — | INF-01 (#32), INT-01 (#36) |
+| Batch pipeline Trip History NYC 01–10/2026 | 1.1, 1.2, 1.3, 2.2 | BAT-01..BAT-12 |
+| Streaming pipeline GBFS 2.3 → Kafka | 1.4, 1.5, 2.3 | STR-01..STR-04 |
+| Lakehouse Bronze/Silver/Gold trên Iceberg | 1.3, 1.4, 1.5, 1.6, 2.4 | BAT-04, BAT-07, STR-07..STR-12, MOD-01 |
+| Data models và data quality tests | 1.6, 3.2 | MOD-01, MOD-02, BAT-12, STR-09 |
+| Grafana dashboard nhu cầu và trạng thái trạm | 1.6, 1.7 | VIS-01 (#31) |
+| PostgreSQL latest state | 1.7, 2.3.4 | STR-05, STR-06 |
+| Cảnh báo thiếu xe, hết xe, ngừng hoạt động, stale | 1.7 | STR-05b (#39), VIS-01 |
+| Airflow DAGs | 2.2.3 | INF-03 (#34) |
+| CI: lint, unit, contract tests | 3.1 | INF-02 (#33) |
+| HA và fault tolerance | 2.1, 2.4 | INF-04 (#35), STR-12 |
+| Iceberg maintenance / compaction (scope Slide 7, 9) | — | **Chưa có issue** |
+| Khôi phục / đối soát PostgreSQL từ Iceberg (scope Slide 7, 9, 10) | 2.4 (thực hiện sau) | **Chưa có issue** (giai đoạn sau, mục 5) |
+| Tài liệu vận hành | — | `docs/runbook.md`; **chưa có issue riêng** |
 
 ---
 
@@ -392,18 +490,24 @@ CI ban đầu gồm đúng **ba nhóm kiểm tra**:
 
 | Mục | Trạng thái | Người phối hợp |
 |---|---|---|
-| Xác nhận toàn bộ field của GBFS v2.3 và vị trí feed metadata | **Pending** | Quan + Kien |
-| Chính sách `num_bikes_available = NULL` | **Đề xuất reject; cần chốt** | Quan + Kien |
-| Grain/snapshot policy của `station_information` | **Pending** | Quan + Kien |
+| Tập trường giữ trong message Kafka `station_status` / `station_information` (STR-07, STR-10 phụ thuộc; mục 1.4, 1.5) | **Pending — chốt trước STR-07** | Quan + Kien + Nguyen |
+| Vị trí metadata cấp feed (`last_updated`) | **Đã chốt:** lấy từ cấp feed (mục 1.4) | Quan + Kien |
+| Chính sách `num_bikes_available = NULL` | **Đã hiện thực reject; chờ Kien xác nhận** | Quan + Kien |
+| Grain/snapshot policy của `station_information`; có xuất `poll_id` vào message không | **Pending** | Quan + Kien + Nguyen |
+| Công thức STALE | **Đã chốt:** `now() - last_reported` (mục 1.7) | Quan + Kien |
+| Điều kiện chính xác của `UNAVAILABLE` | **Pending** (#39) | Quan + Kien |
+| `opened_at` / `updated_at` của cảnh báo theo `collected_at` hay `now()` | **Pending** (#39) | Quan + Kien |
 | Công thức và fixture đối chiếu Gold metrics | **Pending** | Kien + Khang/Quan |
 | Chính sách xử lý `ended_at < started_at` | **Đề xuất; cần chốt** | Khang + Kien |
 | Nơi lưu/định dạng audit file và xử lý `ride_id` conflict vào Silver | **Pending** | Khang + Kien |
 | Mapping giữa Trip History station ID và GBFS station ID | **Issue nghiên cứu** | Kien + Khang/Quan |
-| Số Kafka partitions (đang đề xuất 3) | **Pending benchmark** | Nguyen + Quan |
-| Quy tắc Kafka offset commit và Spark checkpoint/replay khi crash | **Cần hiện thực + test** | Quan + Nguyen |
+| Số Kafka partitions | **Đã hiện thực 3; chờ benchmark** | Nguyen + Quan |
+| Commit Kafka offset của Python consumer | **Đã chốt:** sau khi PostgreSQL commit (mục 2.3.4) | Quan |
+| Spark checkpoint/replay khi crash | **Cần hiện thực + test** (STR-11, STR-12) | Nguyen |
 | Airflow job-launch mechanism (Docker CLI mới là đề xuất) | **Pending** | Nguyen |
 | Mức HA thực tế: local simulation so với triển khai nhiều host | **Định hướng; chưa nghiệm thu** | Nguyen + cả nhóm |
-| Rebuild PostgreSQL latest state | **Giai đoạn sau** | Quan + Nguyen |
+| Rebuild PostgreSQL latest state | **Giai đoạn sau; chưa có issue** | Quan + Nguyen |
+| Iceberg maintenance / compaction | **Chưa có issue** | Nguyen + Kien |
 
 ---
 
