@@ -1,42 +1,51 @@
-# GBFS Ingestion — STR-01 đến STR-03
+# GBFS Ingestion — STR-01 đến STR-04
 
-Module thu thập và chuẩn hóa dữ liệu Citi Bike GBFS 2.3.
+Module thu thập, chuẩn hóa và gửi dữ liệu Citi Bike GBFS 2.3 vào Kafka,
+đồng thời lưu raw JSON lên MinIO.
 
 ## Trạng thái hiện tại
 
-- Đã xây dựng Pydantic models và xuất JSON Schema.
-- Đã chạy thành công 29 unit tests:
-  16 schema, 4 vòng polling và 9 producer.
-- Đã chạy thử poller trong 130 giây:
-  3 lần station_status và 1 lần station_information.
-- Đã tích hợp poller với Kafka Producer.
-- Đã thử định tuyến dữ liệu lỗi sang gbfs.invalid.
-- Đã đối soát một lần polling của mỗi feed:
+- Đã xây dựng Pydantic models và xuất JSON Schema (STR-01).
+- Poller lấy `station_status` mỗi 60 giây và `station_information`
+  mỗi 24 giờ, mỗi feed có `poll_id` riêng (STR-02).
+- Đã tích hợp Kafka Producer, key là `station_id`; bản ghi lỗi
+  được định tuyến sang `gbfs.invalid` (STR-03).
+- Đã lưu raw JSON lên MinIO và thêm retry có giới hạn, backoff,
+  jitter khi gọi GBFS API (STR-04).
+- Đã chạy thành công 32 unit tests:
+  16 schema, 4 vòng polling, 9 producer và 3 retry.
+- Đã đối soát một lần polling của mỗi feed trên Kafka local:
   2.519 message/feed, khớp key, nội dung và số lượng.
-- Chưa tích hợp MinIO và PostgreSQL.
-- Chưa xác minh khả năng phục hồi sau crash hoặc mất kết nối.
+- Latest State Consumer ghi PostgreSQL nằm ở
+  `serving/latest_state_consumer.py` (STR-05), không thuộc module này.
 
 Schema hiện tại sử dụng danh sách trường chuẩn hóa do nhóm lựa chọn,
 không đại diện cho toàn bộ các trường của GBFS 2.3.
 
 ## Cài thư viện
 
-Chạy các lệnh từ thư mục gốc repository, trong môi trường Python riêng:
+Chỉ cần khi chạy trên máy host. Chạy từ thư mục gốc repository,
+trong môi trường Python riêng (Python 3.11, giống image Docker):
 
 ```bash
 python -m pip install -r ingestion/gbfs/requirements.txt
 ```
+
+Khi chạy bằng Docker Compose, image `citibike/python:local`
+đã cài sẵn các thư viện trong `infra/python/requirements.txt`.
 
 ## Các file chính
 
 | File | Vai trò |
 |---|---|
 | `schemas.py` | Kiểm tra và chuẩn hóa bản ghi, metadata và message lỗi |
+| `poller.py` | Tìm URL feed, thu thập, chuẩn hóa, lưu file, gọi archive và producer |
+| `producer.py` | Gửi message vào Kafka và xác nhận số message broker đã nhận |
+| `raw_storage.py` | Upload `raw.json` lên MinIO |
 | `inspect_sample.py` | Kiểm kê trường và kiểu dữ liệu trong file mẫu |
 | `export_schemas.py` | Xuất JSON Schema của message chuẩn hóa |
-| `poller.py` | Tìm URL feed, thu thập, chuẩn hóa và lưu kết quả trên máy |
 | `json_schemas/` | Các JSON Schema để producer và consumer tham chiếu |
-| `requirements.txt` | Thư viện Python cần cài |
+| `requirements.txt` | Thư viện Python cần cài khi chạy trên host |
 
 ## Schema message chuẩn hóa
 
@@ -99,7 +108,7 @@ Message lỗi không được có trường ngoài schema đã định nghĩa.
 
 - Các trường message nằm cùng cấp, không bọc trong object `station`.
 - Chỉ xuất những trường được định nghĩa trong schema.
-- JSON nguồn đầy đủ được lưu riêng trong `raw.json`.
+- JSON nguồn đầy đủ được lưu riêng trong `raw.json` và trên MinIO.
 - Các cờ hoạt động đầu vào chỉ nhận 0/1 hoặc boolean.
 - Cờ hoạt động được chuẩn hóa thành boolean.
 - Số lượng xe và dock không được âm.
@@ -107,7 +116,8 @@ Message lỗi không được có trường ngoài schema đã định nghĩa.
 - Xuất message bằng `model_dump_json()`, để trường nullable bị thiếu
   có giá trị null trong đầu ra.
 - Không thay `last_reported` cũ bằng giờ hiện tại.
-- Poller tạo `collected_at` bằng thời gian UTC có timezone.
+- Poller tạo `collected_at` bằng thời gian UTC có timezone,
+  ngay sau khi nhận phản hồi từ API.
 - `last_updated` được lấy từ metadata cấp feed.
 
 ## Polling
@@ -117,44 +127,127 @@ Message lỗi không được có trường ngoài schema đã định nghĩa.
 | `station_status` | 60 giây |
 | `station_information` | 86.400 giây, tương đương 24 giờ |
 
-Cả hai feed được lấy khi chương trình khởi động.
+- Cả hai feed được lấy ngay khi chương trình khởi động,
+  mỗi feed chạy trong một luồng riêng.
+- URL của feed được tìm một lần qua discovery URL lúc khởi động.
+- Chu kỳ tính cả thời gian gọi API và xử lý; nếu một lần polling
+  chạy quá chu kỳ, lần tiếp theo chờ tối thiểu 1 giây,
+  không chạy dồn các lần đã lỡ.
+- Mỗi lần polling có `poll_id` dạng `<feed_name>-<uuid4>`,
+  hai feed không dùng chung `poll_id`.
+  Mã polling của information chỉ dùng cho đường dẫn raw,
+  không được xuất vào message chuẩn hóa.
+- Các lần polling khác nhau vẫn được ghi nhận khi trạng thái không đổi.
+  Khi bổ sung replay, phải giữ nguyên metadata của observation gốc.
 
-Mỗi feed có mã polling riêng để truy vết file raw.
-Mã polling của information không được xuất vào message chuẩn hóa.
+### Thứ tự xử lý một lần polling
 
-Các lần polling khác nhau vẫn được ghi nhận khi trạng thái không đổi.
-Khi bổ sung replay, phải giữ nguyên metadata của observation gốc.
+1. Gọi API (có retry), ghi nhận `collected_at`.
+2. Ghi `raw.json` vào thư mục đầu ra trên máy.
+3. Nếu `GBFS_ARCHIVE_RAW=true`: upload `raw.json` lên MinIO.
+4. Validate từng trạm, ghi `valid.jsonl` và `invalid.jsonl`.
+5. Nếu `GBFS_PUBLISH_KAFKA=true`: gửi message vào Kafka,
+   chờ broker xác nhận rồi ghi `kafka_delivery.json`.
 
-### Chạy một lần
+### Biến cấu hình
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `GBFS_DISCOVERY_URL` | `https://gbfs.lyft.com/gbfs/2.3/bkn/gbfs.json` | Discovery URL của GBFS 2.3 |
+| `POLL_INTERVAL_SECONDS` | `60` | Chu kỳ `station_status` |
+| `INFORMATION_POLL_INTERVAL_SECONDS` | `86400` | Chu kỳ `station_information`; nếu không đặt, dùng `GBFS_INFORMATION_INTERVAL_SECONDS` |
+| `GBFS_PUBLISH_KAFKA` | `false` | Gửi message vào Kafka |
+| `GBFS_ARCHIVE_RAW` | `false` | Upload `raw.json` lên MinIO |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka broker |
+| `GBFS_STATUS_TOPIC` | `gbfs.station_status` | Topic status |
+| `GBFS_INFORMATION_TOPIC` | `gbfs.station_information` | Topic information |
+| `GBFS_INVALID_TOPIC` | `gbfs.invalid` | Topic bản ghi lỗi |
+| `S3_ENDPOINT_URL` | bắt buộc khi archive | Endpoint MinIO |
+| `AWS_ACCESS_KEY_ID` | bắt buộc khi archive | MinIO user (`MINIO_ROOT_USER`) |
+| `AWS_SECRET_ACCESS_KEY` | bắt buộc khi archive | MinIO password (`MINIO_ROOT_PASSWORD`) |
+| `RAW_BUCKET` | `raw` | Bucket lưu raw JSON |
+
+Trong Docker Compose, service `gbfs-poller` đã đặt sẵn các biến trên,
+bao gồm `GBFS_PUBLISH_KAFKA=true` và `GBFS_ARCHIVE_RAW=true`.
+
+## Cách chạy polling
+
+### Cách 1 — Docker Compose (khuyến nghị)
+
+Khởi động stack mặc định một lần để tạo bucket MinIO và Kafka topics:
+
+```bash
+docker compose up -d
+```
+
+Chạy poller liên tục (gửi Kafka và lưu raw lên MinIO):
+
+```bash
+docker compose --profile pipeline up -d --build gbfs-poller
+```
+
+Xem log:
+
+```bash
+docker compose logs -f gbfs-poller
+```
+
+Mỗi lần polling thành công có các dòng `feed=... valid=... invalid=...`,
+`Raw archived feed=... uri=s3://raw/...` và `Kafka confirmed feed=...`.
+
+Dừng poller:
+
+```bash
+docker compose --profile pipeline stop gbfs-poller
+```
+
+File đầu ra trong container nằm ở `/app/data/gbfs/`,
+không được mount ra máy host.
+
+### Cách 2 — Trên máy host, chỉ ghi file
+
+Không cần Kafka hoặc MinIO. Phù hợp để kiểm tra schema và dữ liệu nguồn.
+
+Chạy một lần:
 
 ```bash
 python -m ingestion.gbfs.poller --once
 ```
 
-### Chạy thử trong 130 giây
+Chạy thử trong 130 giây:
 
 ```bash
 python -m ingestion.gbfs.poller --duration 130
 ```
 
-### Chạy liên tục
+Chạy liên tục:
 
 ```bash
 python -m ingestion.gbfs.poller
 ```
 
-Nhấn Ctrl+C để yêu cầu dừng.
-Nếu đang gọi API, chương trình chờ lần gọi đó kết thúc.
+### Cách 3 — Trên máy host, gửi Kafka và lưu MinIO
 
-### Biến cấu hình
+Cần stack Docker Compose đang chạy (`docker compose up -d`).
+Python trên host dùng `localhost:9092` cho Kafka và
+`http://localhost:9000` cho MinIO; ứng dụng trong mạng Compose
+dùng `kafka:29092` và `http://minio:9000`.
 
-| Biến | Mặc định |
-|---|---|
-| `GBFS_DISCOVERY_URL` | `https://gbfs.lyft.com/gbfs/2.3/bkn/gbfs.json` |
-| `POLL_INTERVAL_SECONDS` | `60` |
-| `GBFS_INFORMATION_INTERVAL_SECONDS` | `86400` |
+Thay `<MINIO_ROOT_PASSWORD>` bằng giá trị trong `.env`
+(mặc định của Compose là `citibike-local-secret`):
 
-## Đầu ra chạy thử
+```bash
+GBFS_PUBLISH_KAFKA=true GBFS_ARCHIVE_RAW=true S3_ENDPOINT_URL=http://localhost:9000 AWS_ACCESS_KEY_ID=citibike AWS_SECRET_ACCESS_KEY=<MINIO_ROOT_PASSWORD> python -m ingestion.gbfs.poller --once
+```
+
+Bỏ `--once` để chạy liên tục, hoặc dùng `--duration <giây>`.
+
+### Dừng chương trình
+
+Ở chế độ liên tục, nhấn Ctrl+C để yêu cầu dừng. Nếu đang gọi API
+hoặc gửi Kafka, chương trình chờ lần polling đó kết thúc.
+
+## Đầu ra trên máy
 
 Mỗi lần thu thập lưu tại:
 
@@ -165,20 +258,105 @@ Mỗi lần thu thập lưu tại:
 | `raw.json` | JSON nguồn, URL, poll_id và collected_at |
 | `valid.jsonl` | Mỗi dòng là một message hợp lệ |
 | `invalid.jsonl` | Mỗi dòng là một message mô tả bản ghi lỗi |
+| `kafka_delivery.json` | Số message broker đã xác nhận, chỉ có khi gửi Kafka thành công |
 
 Thư mục `data/` không được commit lên GitHub.
+Mỗi lần polling `station_status` chiếm khoảng 2,8 MB;
+chương trình chưa tự dọn các thư mục cũ.
 
-Đây là lưu trữ trên máy để phát triển.
-Tích hợp raw storage trên MinIO thuộc STR-04.
+## Lưu raw JSON lên MinIO (STR-04)
 
-## Xử lý lỗi hiện tại
+Bật bằng `GBFS_ARCHIVE_RAW=true`. Sau khi ghi `raw.json` trên máy,
+poller upload chính file đó lên:
 
-- Bản ghi trạm sai cấu trúc hoặc vi phạm schema được ghi vào invalid.
+```text
+s3://<RAW_BUCKET>/gbfs/<feed_name>/date=<YYYY-MM-DD>/<poll_id>/raw.json
+```
+
+- `date` lấy theo `collected_at` (UTC).
+- Nội dung gồm JSON nguồn đầy đủ cùng `poll_id`, `source_url`
+  và `collected_at`, đủ để kiểm tra và xử lý lại.
+- Client S3 dùng path-style addressing, timeout kết nối 5 giây,
+  timeout đọc 15 giây và tối đa 3 lần thử (retry mode `standard` của boto3).
+
+Kiểm tra file đã lưu: mở MinIO console tại http://localhost:9001,
+đăng nhập bằng `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`,
+vào bucket `raw`, thư mục `gbfs/`.
+
+## Retry và xử lý lỗi
+
+### Gọi GBFS API
+
+| Tình huống | Xử lý |
+|---|---|
+| HTTP 429, 500, 502, 503, 504 | Retry |
+| Lỗi mạng (`URLError`, `ConnectionError`) hoặc timeout | Retry |
+| HTTP khác (ví dụ 404) | Không retry, báo lỗi ngay |
+
+- Tối đa 3 lần gọi cho mỗi request, timeout 30 giây mỗi lần.
+- Thời gian chờ dùng exponential backoff với full jitter:
+  ngẫu nhiên trong `[0, 1]` giây sau lần lỗi thứ nhất,
+  `[0, 2]` giây sau lần lỗi thứ hai.
+- Mỗi lần retry ghi log mức WARNING với URL, lý do và thời gian chờ.
+- Khi hết số lần thử, lần polling đó thất bại. Ở chế độ liên tục,
+  lỗi được log (`Polling thất bại`) và thử lại ở chu kỳ tiếp theo.
 - Lỗi mạng không được biến thành message invalid.
-- Trong chế độ chạy liên tục, lỗi polling được log và thử lại
-  ở chu kỳ tiếp theo.
-- Retry có giới hạn, backoff, jitter và xử lý lỗi cấp feed đầy đủ
-  chưa được triển khai.
+
+### Validation
+
+- Bản ghi trạm sai cấu trúc hoặc vi phạm schema được ghi vào
+  `invalid.jsonl` và gửi sang `gbfs.invalid`.
+- Lỗi cấp feed (thiếu `last_updated`, `data.stations` không phải
+  danh sách) làm cả lần polling thất bại và chỉ được ghi log.
+
+### Kafka Producer
+
+- `enable.idempotence=true`, `acks=all`, `message.timeout.ms=30000`.
+- Khi hàng đợi producer đầy, chờ tối đa 10 giây để có chỗ trống.
+- Sau khi gửi, chờ broker xác nhận tối đa 35 giây; nếu còn message
+  chưa xác nhận hoặc có lỗi delivery, lần polling báo lỗi
+  và không ghi `kafka_delivery.json`.
+
+## Kafka
+
+Ba topic do `kafka-init` tạo (3 partitions/topic, replication factor 1,
+giữ 7 ngày; số partition còn chờ nhóm benchmark):
+
+- `gbfs.station_status`
+- `gbfs.station_information`
+- `gbfs.invalid`
+
+Nếu chỉ cần Kafka mà không chạy cả stack:
+
+```bash
+docker compose up -d kafka
+docker compose run --rm kafka-init
+```
+
+### Xác nhận gửi dữ liệu
+
+Sau khi Kafka xác nhận toàn bộ message của lần polling,
+poller ghi `kafka_delivery.json` trong thư mục đầu ra.
+
+File này ghi nhận số message được broker xác nhận.
+Nó không chứng minh consumer phía sau đã xử lý thành công.
+
+### Đối soát dữ liệu
+
+Thay đường dẫn dưới đây bằng thư mục polling cần kiểm tra:
+
+```bash
+python tests/integration/check_kafka_delivery.py data/gbfs/station_status/<poll_id>
+```
+
+Với information:
+
+```bash
+python tests/integration/check_kafka_delivery.py data/gbfs/station_information/<poll_id>
+```
+
+Đối soát kiểm tra key, nội dung và số lượng của các message hợp lệ.
+Status được nhận diện bằng poll_id; information bằng collected_at.
 
 ## Chạy unit tests GBFS
 
@@ -186,16 +364,13 @@ Tích hợp raw storage trên MinIO thuộc STR-04.
 python -m unittest discover -s tests/unit -p "test_gbfs*.py" -v
 ```
 
-Kết quả đã ghi nhận: 29 tests thành công.
+Kết quả đã ghi nhận: 32 tests thành công.
 
-Các test kiểm tra schema, logic vòng polling và producer
-với Kafka client giả lập.
+Các test kiểm tra schema, logic vòng polling, retry khi gọi API
+và producer với Kafka client giả lập.
 
 Chu kỳ 24 giờ được kiểm tra phép tính thời gian bằng đồng hồ giả;
 chưa chạy kiểm thử thực tế kéo dài 24 giờ.
-
-Đã kiểm tra gửi/nhận và đối soát trên Kafka local.
-Chưa kiểm thử MinIO, PostgreSQL hoặc khả năng phục hồi sau crash.
 
 ## Xuất JSON Schema
 
@@ -207,80 +382,26 @@ Các file được tạo trong `ingestion/gbfs/json_schemas/`.
 
 Đây là schema của message sau chuẩn hóa.
 
+## Hạn chế đã biết
+
+- Nếu upload MinIO thất bại, cả lần polling dừng trước bước
+  validate và gửi Kafka.
+- Nếu gửi Kafka thất bại giữa chừng, một phần message có thể đã được ghi;
+  chưa có cơ chế tự replay thư mục polling cũ hoặc bảo đảm
+  exactly-once cho toàn bộ pipeline.
+- Chưa xử lý SIGTERM: `docker stop` có thể cắt ngang lần polling
+  đang chạy.
+- Khi hết số lần retry, lỗi chỉ được ghi log, chưa phát alert.
+- Thư mục đầu ra trên máy và trong container chưa được tự dọn.
+- Chưa có unit test cho `raw_storage.py`.
+
 ## Các mục cần hoàn thiện
 
 - Review schema với người phụ trách Data Modeling / Data Quality.
 - Đồng bộ danh sách trường mới vào contract chung của nhóm.
 - Chốt chính sách xử lý num_bikes_available = null.
-- Chốt grain và chính sách snapshot của information.
-- Tích hợp MinIO, retry, backoff và jitter.
-- Xây dựng PostgreSQL consumer và kiểm thử replay/recovery.
-
-## Chạy pipeline với Kafka
-
-Chạy từ thư mục gốc repository trên máy phát triển.
-
-### Khởi động broker và tạo topic
-
-```bash
-docker compose up -d kafka
-docker compose run --rm kafka-init
-```
-
-Ba topic:
-
-- gbfs.station_status
-- gbfs.station_information
-- gbfs.invalid
-
-Script hiện dùng cấu hình thử nghiệm 3 partitions/topic,
-replication factor 1; số partition còn chờ nhóm benchmark.
-
-### Gửi một lần polling sang Kafka
-
-```bash
-GBFS_PUBLISH_KAFKA=true python -m ingestion.gbfs.poller --once
-```
-
-### Chạy liên tục và gửi Kafka
-
-```bash
-GBFS_PUBLISH_KAFKA=true python -m ingestion.gbfs.poller
-```
-
-Mặc định GBFS_PUBLISH_KAFKA=false: poller chỉ ghi file.
-
-Python chạy trên host dùng KAFKA_BOOTSTRAP_SERVERS=localhost:9092.
-Ứng dụng trong mạng Compose dùng kafka:29092.
-
-### Xác nhận gửi dữ liệu
-
-Sau khi Kafka xác nhận toàn bộ message của lần polling,
-poller ghi kafka_delivery.json trong thư mục đầu ra.
-
-File này ghi nhận số message được broker xác nhận.
-Nó không chứng minh consumer phía sau đã xử lý thành công.
-
-### Đối soát dữ liệu
-
-Thay đường dẫn dưới đây bằng thư mục polling cần kiểm tra:
-
-```bash
-python tests/integration/check_kafka_delivery.py \
-  data/gbfs/station_status/<poll_id>
-```
-
-Với information:
-
-```bash
-python tests/integration/check_kafka_delivery.py \
-  data/gbfs/station_information/<poll_id>
-```
-
-Đối soát kiểm tra key, nội dung và số lượng của các message hợp lệ.
-Status được nhận diện bằng poll_id; information bằng collected_at.
-
-Nếu gửi Kafka thất bại giữa chừng, một phần message có thể đã được ghi.
-Hiện chưa có cơ chế tự replay file cũ hoặc bảo đảm exactly-once
-cho toàn bộ pipeline.
-
+- Chốt grain và chính sách snapshot của information,
+  bao gồm việc có xuất `poll_id` của information hay không.
+- Chốt có giữ thêm các trường nguồn đang bị loại
+  (ví dụ `num_bikes_disabled`, `num_ebikes_available`, `region_id`)
+  trước khi làm Spark Kafka Source (STR-07).
