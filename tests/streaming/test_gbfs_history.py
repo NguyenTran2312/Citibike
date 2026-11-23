@@ -23,8 +23,8 @@ PRODUCER_SCHEMAS = REPO / "ingestion" / "gbfs" / "json_schemas"
 
 if SparkSession is not None:
     from streaming.jobs.gbfs_history import (
-        PARSE_ERROR, SCHEMA_ERROR, VALIDATION_ERROR,
-        invalid_rows, parse_value, valid_rows, validate)
+        BRONZE_COLUMNS, PARSE_ERROR, SCHEMA_ERROR, VALIDATION_ERROR,
+        bronze_rows, invalid_rows, parse_value, valid_rows, validate)
     from streaming.utils.schemas import (
         INVALID_SCHEMA, STATION_INFORMATION_SCHEMA, STATION_STATUS_SCHEMA)
 
@@ -254,6 +254,76 @@ class ParseValidateTest(unittest.TestCase):
         self.assertEqual((row.kafka_topic, row.kafka_partition, row.kafka_offset),
                          ("gbfs.station_status", 2, 41))
         self.assertEqual(row.station_id, "abc")
+
+    # --- Bronze (STR-08) ------------------------------------------------------
+    def _kafka_df(self, values, topic="gbfs.station_status"):
+        rows = [(bytearray(v, "utf-8") if v is not None else None, key, topic, 0, offset)
+                for offset, (key, v) in enumerate(values)]
+        return self.spark.createDataFrame(
+            rows, "value binary, key string, topic string, partition int, offset long"
+        ).withColumn("key", F.col("key").cast("binary")) \
+         .withColumn("timestamp", F.current_timestamp())
+
+    def _bronze(self, values, feed="status", schema=None):
+        schema = schema or STATION_STATUS_SCHEMA
+        df = self._kafka_df(values)
+        return bronze_rows(validate(parse_value(df, schema), feed))
+
+    def test_bronze_keeps_every_message_as_received(self):
+        valid = json.dumps(_valid_status())
+        broken = json.dumps(_valid_status(num_docks_available=-1))
+        values = [("abc", valid), ("abc", "not json"), ("abc", broken), (None, None)]
+
+        rows = self._bronze(values).orderBy("kafka_offset").collect()
+
+        self.assertEqual(len(rows), 4)   # nothing is dropped
+        self.assertEqual([r.raw_value for r in rows], [valid, "not json", broken, None])
+        self.assertEqual([r.dq_is_valid for r in rows], [True, False, False, False])
+        self.assertEqual([r.dq_error_type for r in rows],
+                         [None, PARSE_ERROR, VALIDATION_ERROR, PARSE_ERROR])
+        self.assertEqual([r.kafka_offset for r in rows], [0, 1, 2, 3])
+        self.assertEqual([r.kafka_key for r in rows], ["abc", "abc", "abc", None])
+        self.assertTrue(all(r.ingested_at is not None for r in rows))
+
+    def test_bronze_copies_identity_fields_out_of_the_message(self):
+        row = self._bronze([("abc", json.dumps(_valid_status()))]).collect()[0]
+
+        self.assertEqual(row.poll_id, "poll-20261116T024000Z")
+        self.assertEqual(row.station_id, "abc")
+        self.assertEqual(row.collected_at.isoformat(), "2026-11-16T02:40:00")  # UTC session
+        self.assertEqual(row.kafka_topic, "gbfs.station_status")
+
+        unparsed = self._bronze([("abc", "not json")]).collect()[0]
+        self.assertIsNone(unparsed.station_id)
+        self.assertIsNone(unparsed.collected_at)
+
+    def test_bronze_information_rows(self):
+        msg = _valid_information()
+        df = self._kafka_df([(msg["station_id"], json.dumps(msg))],
+                            topic="gbfs.station_information")
+        row = bronze_rows(validate(parse_value(df, STATION_INFORMATION_SCHEMA),
+                                   "information")).collect()[0]
+        self.assertTrue(row.dq_is_valid)
+        self.assertEqual(row.poll_id, msg["poll_id"])
+        self.assertEqual(row.kafka_topic, "gbfs.station_information")
+
+    def test_bronze_columns_and_types_match_the_table(self):
+        schema = self._bronze([("abc", json.dumps(_valid_status()))]).schema
+        self.assertEqual(schema.fieldNames(), BRONZE_COLUMNS)
+        types = {f.name: f.dataType.simpleString() for f in schema.fields}
+        self.assertEqual(types, {
+            "kafka_topic": "string", "kafka_partition": "int", "kafka_offset": "bigint",
+            "kafka_timestamp": "timestamp", "kafka_key": "string", "raw_value": "string",
+            "poll_id": "string", "station_id": "string", "collected_at": "timestamp",
+            "dq_is_valid": "boolean", "dq_error_type": "string",
+            "dq_error_message": "string", "ingested_at": "timestamp",
+        })
+
+    def test_bronze_from_text_input_has_typed_null_kafka_columns(self):
+        rows = bronze_rows(self._validate(_fixture_lines("station_status.jsonl"), "status",
+                                          STATION_STATUS_SCHEMA))
+        self.assertEqual(rows.schema["kafka_offset"].dataType.simpleString(), "bigint")
+        self.assertTrue(all(r.kafka_offset is None for r in rows.collect()))
 
 
 if __name__ == "__main__":

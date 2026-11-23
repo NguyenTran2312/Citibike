@@ -30,7 +30,7 @@ produce() {  # stdin -> test topic
 run_job() {  # $1 = run name; prints "<valid> <invalid> <batches with rows>"
   docker compose exec -T -e GBFS_STATUS_TOPIC="$TOPIC" spark-master \
     /opt/spark/bin/spark-submit /opt/project/streaming/jobs/gbfs_history.py \
-    --feed status --available-now --checkpoint-dir "$CKPT" >"$LOG_DIR/$1.log" 2>&1
+    --sink console --feed status --available-now --checkpoint-dir "$CKPT" >"$LOG_DIR/$1.log" 2>&1
   grep -E '^\[status\] batch [0-9]+:' "$LOG_DIR/$1.log" \
     | awk '{v+=$4; i+=$6; if ($4+$6>0) b++} END {printf "%d %d %d\n", v, i, b}'
 }

@@ -2,18 +2,24 @@
 
 Entry point of the `spark-streaming` service in docker-compose.yml.
 
-Current scope (STR-07): Kafka source, from_json with the agreed schemas,
-valid / invalid classification, fixture check, console sink, restart from a
-test checkpoint. The Iceberg sink (dedup on (station_id, poll_id),
-STATUS_/INFORMATION_CHECKPOINT_LOCATION) comes in a later issue.
+Scope:
+  STR-07  Kafka source, from_json with the agreed schemas, valid / invalid
+          classification, fixture check, console sink.
+  STR-08  Iceberg Bronze sink (default): every Kafka message is appended as
+          received (raw value + Kafka position + dq flags) to
+          bronze.gbfs_status / bronze.gbfs_station_information. Nothing is
+          dropped or deduplicated here; Silver (STR-09/10) does that.
 
 Run inside the spark containers (see streaming/README.md):
   # parse + validate the fixture JSON (no Kafka needed)
   spark-submit /opt/project/streaming/jobs/gbfs_history.py --fixture
 
+  # read Kafka, append every message to the Bronze tables (service default)
+  spark-submit /opt/project/streaming/jobs/gbfs_history.py
+
   # read Kafka, print valid and invalid rows of every micro-batch
-  spark-submit /opt/project/streaming/jobs/gbfs_history.py --feed status \
-      --checkpoint-dir /tmp/str07-checkpoints [--available-now]
+  spark-submit /opt/project/streaming/jobs/gbfs_history.py --sink console \
+      --feed status --checkpoint-dir /tmp/str07-checkpoints [--available-now]
 
 Environment (names match docker-compose.yml):
   KAFKA_BOOTSTRAP_SERVERS   default kafka:29092
@@ -23,6 +29,10 @@ Environment (names match docker-compose.yml):
   STREAM_TRIGGER_INTERVAL   default "5 minutes" (contract 2.3.3); use "30 seconds" to debug
   STARTING_OFFSETS          default earliest (first run only; then the checkpoint wins)
   MAX_OFFSETS_PER_TRIGGER   default 5000
+  STATUS_CHECKPOINT_LOCATION / INFORMATION_CHECKPOINT_LOCATION
+                            checkpoints of the Bronze queries (one per feed)
+  BRONZE_STATUS_TABLE       default lakehouse.bronze.gbfs_status
+  BRONZE_INFORMATION_TABLE  default lakehouse.bronze.gbfs_station_information
 """
 from __future__ import annotations  # apache/spark:3.5.6 ships Python 3.8
 
@@ -52,6 +62,15 @@ INFORMATION_TOPIC = os.environ.get("GBFS_INFORMATION_TOPIC", TOPIC_STATION_INFOR
 TRIGGER_INTERVAL = os.environ.get("STREAM_TRIGGER_INTERVAL", "5 minutes")
 STARTING_OFFSETS = os.environ.get("STARTING_OFFSETS", "earliest")
 MAX_OFFSETS_PER_TRIGGER = int(os.environ.get("MAX_OFFSETS_PER_TRIGGER", "5000"))
+BRONZE_TABLES = {
+    "status": os.environ.get("BRONZE_STATUS_TABLE", "lakehouse.bronze.gbfs_status"),
+    "information": os.environ.get("BRONZE_INFORMATION_TABLE",
+                                  "lakehouse.bronze.gbfs_station_information"),
+}
+BRONZE_CHECKPOINTS = {
+    "status": os.environ.get("STATUS_CHECKPOINT_LOCATION"),
+    "information": os.environ.get("INFORMATION_CHECKPOINT_LOCATION"),
+}
 
 # error_type values, same vocabulary as the gbfs.invalid contract (docs/contracts.md 2.3.2)
 PARSE_ERROR = "PARSE_ERROR"            # not JSON at all (or empty message)
@@ -59,7 +78,7 @@ SCHEMA_ERROR = "SCHEMA_ERROR"          # valid JSON, but not an object or a fiel
 VALIDATION_ERROR = "VALIDATION_ERROR"  # parsed, but breaks a contract rule (missing field, range...)
 
 CORRUPT_COL = "_corrupt_record"
-KAFKA_META = ["kafka_topic", "kafka_partition", "kafka_offset", "kafka_timestamp"]
+KAFKA_META = ["kafka_topic", "kafka_partition", "kafka_offset", "kafka_timestamp", "kafka_key"]
 # ISO-8601 with an explicit timezone: ...Z or ...+07:00 / -0500
 TZ_SUFFIX = r"(Z|[+-][0-9]{2}:?[0-9]{2})$"
 
@@ -180,6 +199,8 @@ def parse_value(df: DataFrame, schema: StructType) -> DataFrame:
             F.col("offset").alias("kafka_offset"),
             F.col("timestamp").alias("kafka_timestamp"),
         ]
+        if "key" in df.columns:
+            meta.append(F.col("key").cast("string").alias("kafka_key"))
     parsed = df.select(
         *meta,
         F.from_json(value_str, parse_schema, {"columnNameOfCorruptRecord": CORRUPT_COL}).alias("e"),
@@ -238,6 +259,83 @@ def invalid_rows(validated: DataFrame, feed: str) -> DataFrame:
         F.col("raw_value").alias("raw_payload"),
         F.date_format(F.current_timestamp(), "yyyy-MM-dd'T'HH:mm:ss.SSSXXX").alias("detected_at"),
     )
+
+
+# --- Bronze (STR-08) -------------------------------------------------------------
+# One row per Kafka message, valid or not. raw_value keeps the message exactly as
+# received, so Silver can be rebuilt from Bronze. poll_id / station_id /
+# collected_at are copied out for partition pruning, incremental reads and dedup;
+# they are null when the message could not be parsed.
+BRONZE_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+    kafka_topic      STRING    COMMENT 'Kafka topic the message was read from',
+    kafka_partition  INT,
+    kafka_offset     BIGINT    COMMENT '(kafka_topic, kafka_partition, kafka_offset) identifies a message',
+    kafka_timestamp  TIMESTAMP,
+    kafka_key        STRING    COMMENT 'producer key = station_id',
+    raw_value        STRING    COMMENT 'message value exactly as received',
+    poll_id          STRING,
+    station_id       STRING,
+    collected_at     TIMESTAMP,
+    dq_is_valid      BOOLEAN   COMMENT 'false: see dq_error_type / dq_error_message',
+    dq_error_type    STRING,
+    dq_error_message STRING,
+    ingested_at      TIMESTAMP COMMENT 'when the micro-batch was processed'
+) USING iceberg
+PARTITIONED BY (days(ingested_at))
+TBLPROPERTIES ('format-version' = '2')
+"""
+BRONZE_COLUMNS = ["kafka_topic", "kafka_partition", "kafka_offset", "kafka_timestamp",
+                  "kafka_key", "raw_value", "poll_id", "station_id", "collected_at",
+                  "dq_is_valid", "dq_error_type", "dq_error_message", "ingested_at"]
+
+
+def bronze_rows(validated: DataFrame) -> DataFrame:
+    """Every message (valid or not) in the Bronze table shape."""
+    def column(name: str, dtype: str) -> Column:
+        return F.col(name) if name in validated.columns else F.lit(None).cast(dtype)
+
+    return validated.select(
+        column("kafka_topic", "string").alias("kafka_topic"),
+        column("kafka_partition", "int").alias("kafka_partition"),
+        column("kafka_offset", "bigint").alias("kafka_offset"),
+        column("kafka_timestamp", "timestamp").alias("kafka_timestamp"),
+        column("kafka_key", "string").alias("kafka_key"),
+        F.col("raw_value"),
+        F.col("poll_id"),
+        F.col("station_id"),
+        F.to_timestamp("collected_at").alias("collected_at"),
+        F.col("dq_is_valid"),
+        F.col("dq_error_type"),
+        F.col("dq_error_message"),
+        F.current_timestamp().alias("ingested_at"),
+    )
+
+
+def ensure_bronze_table(spark: SparkSession, feed: str) -> str:
+    table = BRONZE_TABLES[feed]
+    spark.sql(BRONZE_DDL.format(table=table))
+    return table
+
+
+def start_bronze_query(spark: SparkSession, feed: str, checkpoint_dir: str | None,
+                       available_now: bool):
+    checkpoint = (f"{checkpoint_dir.rstrip('/')}/{feed}" if checkpoint_dir
+                  else BRONZE_CHECKPOINTS[feed])
+    if not checkpoint:
+        raise SystemExit(f"no checkpoint for {feed}: set {feed.upper()}_CHECKPOINT_LOCATION "
+                         "or --checkpoint-dir")
+    table = ensure_bronze_table(spark, feed)
+    rows = bronze_rows(validate(parse_value(read_kafka(spark, FEEDS[feed].topic),
+                                            FEEDS[feed].schema), feed))
+    writer = (rows.writeStream.format("iceberg").outputMode("append")
+              .queryName(f"gbfs_{feed}_bronze")
+              .option("checkpointLocation", checkpoint))
+    if available_now:
+        writer = writer.trigger(availableNow=True)
+    else:
+        writer = writer.trigger(processingTime=TRIGGER_INTERVAL)
+    return writer.toTable(table)
 
 
 # --- Fixture check -------------------------------------------------------------
@@ -315,13 +413,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="GBFS Kafka -> Spark history job")
     parser.add_argument("--fixture", action="store_true",
                         help="parse + validate fixture JSON instead of reading Kafka")
-    parser.add_argument("--sink", choices=["console"], default="console",
-                        help="output sink; 'iceberg' will be added after STR-07")
+    parser.add_argument("--sink", choices=["bronze", "console"], default="bronze",
+                        help="bronze: append to the Iceberg Bronze tables (default); "
+                             "console: print valid / invalid rows (debug)")
     parser.add_argument("--feed", choices=STREAM_FEEDS + ["all"], default="all",
                         help="which feed to stream (default: %(default)s)")
     parser.add_argument("--checkpoint-dir",
-                        help="test checkpoint root; each feed gets <dir>/<feed>. "
-                             "Without it Spark uses a temp dir and restarts from STARTING_OFFSETS.")
+                        help="checkpoint root; each feed gets <dir>/<feed>. Bronze default: "
+                             "STATUS_/INFORMATION_CHECKPOINT_LOCATION. Console default: a temp "
+                             "dir, so it restarts from STARTING_OFFSETS.")
     parser.add_argument("--available-now", action="store_true",
                         help="process the data available now, then stop (restart tests)")
     args = parser.parse_args()
@@ -334,8 +434,13 @@ def main() -> int:
 
     feeds = STREAM_FEEDS if args.feed == "all" else [args.feed]
     for feed in feeds:
-        start_console_query(spark, feed, args.checkpoint_dir, args.available_now)
-        print(f"started {feed}: {FEEDS[feed].topic} -> {args.sink}", flush=True)
+        if args.sink == "bronze":
+            start_bronze_query(spark, feed, args.checkpoint_dir, args.available_now)
+            target = BRONZE_TABLES[feed]
+        else:
+            start_console_query(spark, feed, args.checkpoint_dir, args.available_now)
+            target = "console"
+        print(f"started {feed}: {FEEDS[feed].topic} -> {target}", flush=True)
 
     if args.available_now:
         for q in spark.streams.active:
