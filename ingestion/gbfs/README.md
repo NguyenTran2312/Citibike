@@ -210,10 +210,10 @@ Dừng poller:
 docker compose --profile pipeline stop gbfs-poller
 ```
 
-File đầu ra trong container nằm ở `/app/data/gbfs/`, không được mount
-ra máy host. Thư mục bị xóa sau mỗi lần polling thành công; thư mục của
-lần polling lỗi được giữ lại để replay nhưng sẽ mất khi container bị tạo
-lại (`docker compose down`/`up --force-recreate`).
+File đầu ra trong container nằm ở `/app/data/gbfs/`, trên volume
+`gbfs-spool`. Thư mục bị xóa sau mỗi lần polling thành công; thư mục của
+lần polling lỗi được giữ lại để replay, kể cả khi container bị tạo lại
+(`up --force-recreate`). Chỉ `docker compose down -v` mới xóa volume này.
 
 ### Cách 2 — Trên máy host, chỉ ghi file
 
@@ -256,9 +256,16 @@ Bỏ `--once` để chạy liên tục, hoặc dùng `--duration <giây>`.
 ### Dừng chương trình
 
 Ở chế độ liên tục, nhấn Ctrl+C hoặc gửi SIGTERM (`docker stop`)
-để yêu cầu dừng. Nếu đang gọi API hoặc gửi Kafka, chương trình chờ
-lần polling đó kết thúc. Compose cho poller tối đa 60 giây
-(`stop_grace_period`) trước khi buộc dừng.
+để yêu cầu dừng:
+
+- Đang gọi GBFS: lần thử hiện tại chạy xong (tối đa 30 giây) nhưng không
+  retry nữa; lần polling đó bị bỏ vì chưa có gì được ghi.
+- Đã lấy được dữ liệu: chạy nốt validate, gửi Kafka (tối đa 35 giây) và
+  upload MinIO rồi mới dừng.
+
+Compose cho poller tối đa 120 giây (`stop_grace_period`) trước khi buộc
+dừng. Nếu bị buộc dừng sau khi đã ghi `raw.json`, thư mục được giữ lại
+để `--replay`. Kiểm thử: `tests/integration/test_poller_shutdown.py`.
 
 ## Đầu ra trên máy
 
@@ -401,7 +408,7 @@ Status được nhận diện bằng poll_id; information bằng collected_at.
 python -m unittest discover -s tests/unit -p "test_gbfs*.py" -v
 ```
 
-Kết quả đã ghi nhận: 54 tests thành công
+Kết quả đã ghi nhận: 56 tests thành công
 (cần thêm `psycopg[binary]` cho test của consumer).
 
 Các test kiểm tra schema, logic vòng polling, retry khi gọi API,
@@ -427,10 +434,10 @@ Các file được tạo trong `ingestion/gbfs/json_schemas/`.
 - Nếu gửi Kafka thất bại giữa chừng, một phần message có thể đã được ghi;
   replay gửi lại cả lần polling (at-least-once), phía sau phải dedup.
 - Replay chạy thủ công bằng `--replay`, chưa tự động.
-- Nếu poller bị buộc dừng (SIGKILL, hết `stop_grace_period`), thư mục
-  của lần polling đang chạy còn lại nếu `raw.json` đã được ghi và
-  container chưa bị tạo lại; replay thủ công được nếu đã có `valid.jsonl`.
-- Thư mục `/app/data` trong container chưa được mount ra volume.
+- Nếu poller bị buộc dừng (SIGKILL, hết `stop_grace_period`) trước khi
+  ghi `raw.json`, lần polling đó bị mất (lịch sử thiếu một observation);
+  sau khi đã ghi `raw.json`, thư mục được giữ trên volume `gbfs-spool` và
+  replay thủ công được nếu đã có `valid.jsonl`.
 - Khi hết số lần retry, lỗi chỉ được ghi log, chưa phát alert.
 - Chưa có unit test cho `raw_storage.py`.
 

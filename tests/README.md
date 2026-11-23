@@ -69,3 +69,35 @@ Thời gian chạy khoảng 75 giây. Đã kiểm tra test bắt được lỗi 
 sửa sai consumer: commit offset trước khi ghi (test_3 fail), bỏ điều kiện
 `collected_at` trong UPSERT (test_1, test_2 fail), crash khi gặp message hỏng
 (test_5 fail).
+
+### Dừng gbfs-poller giữa lần polling
+
+`test_poller_shutdown.py` cho poller gọi GBFS giả lập (`gbfs_mock.py`, điều khiển
+độ trễ và lỗi 503) rồi dừng nó ở các thời điểm khác nhau, sau đó đối chiếu Kafka,
+MinIO, thư mục trên volume `gbfs-spool` và log của GBFS giả lập.
+
+```bash
+export COMPOSE_PROJECT_NAME=citibike-itest
+export COMPOSE_FILE=docker-compose.yml:tests/integration/poller-shutdown.compose.yml
+export GBFS_MOCK_CONTROL_DIR=$(mktemp -d)
+# export MINIO_API_PORT=59000 MINIO_CONSOLE_PORT=59001   # nếu 9000/9001 đã bị chiếm
+docker compose --profile pipeline build gbfs-poller
+docker compose --profile pipeline up -d --wait kafka minio kafka-init minio-init gbfs-mock
+python -m unittest tests.integration.test_poller_shutdown -v
+docker compose --profile pipeline down -v
+```
+
+Mỗi lần polling phải **hoàn tất** (Kafka đủ mọi trạm, raw trên MinIO, thư mục đã
+xóa) hoặc **được giữ lại** (thư mục còn `raw.json` để `--replay`); không có trạng
+thái nào khác.
+
+| Test | Kịch bản | Kết quả đo được |
+|---|---|---|
+| `test_1` | SIGTERM khi GBFS đang trả lời chậm (10 s) | Dừng sau ~12 s, exit 0, cả hai feed hoàn tất |
+| `test_2` | SIGTERM khi GBFS treo quá timeout (cần ~93 s nếu retry đủ) | Dừng sau ~30 s, exit 0, không có dữ liệu ghi dở |
+| `test_3` | SIGTERM khi Kafka treo | Dừng sau ~29 s, exit 0, hai lần polling được giữ lại; `--replay` đưa về hoàn tất |
+| `test_4` | SIGKILL khi MinIO treo (đã gửi Kafka) | Exit 137, hai lần polling được giữ lại |
+| `test_5` | Tạo lại container (`up --force-recreate`) | Thư mục giữ lại vẫn còn (volume), không mất lần polling nào |
+
+Thời gian chạy khoảng 2,5 phút. Trước khi sửa, `test_2` (dừng sau ~92 s) và `test_5`
+(mất thư mục giữ lại) đều fail.

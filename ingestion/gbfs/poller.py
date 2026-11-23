@@ -38,6 +38,10 @@ MODELS = {
 }
 
 
+# Được set khi nhận SIGTERM/Ctrl+C. fetch_json dùng nó để ngừng retry.
+shutdown_requested = threading.Event()
+
+
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -58,14 +62,14 @@ def fetch_json(url):
             error.close()
             if error.code not in {429, 500, 502, 503, 504}:
                 raise
-            if attempt == max_attempts:
-                raise
-            reason = f"HTTP {error.code}"
+            last_error, reason = error, f"HTTP {error.code}"
 
         except (URLError, TimeoutError, ConnectionError) as error:
-            if attempt == max_attempts:
-                raise
-            reason = str(error)
+            last_error, reason = error, str(error)
+
+        if attempt == max_attempts:
+            raise last_error
+        stop_retrying(last_error, url)
 
         max_delay = 2 ** (attempt - 1)
         delay = random.uniform(0, max_delay)
@@ -79,6 +83,15 @@ def fetch_json(url):
             delay,
         )
         time.sleep(delay)
+        stop_retrying(last_error, url)
+
+
+def stop_retrying(error, url):
+    # Đang tắt: chưa có gì của lần polling này được ghi, nên bỏ nó luôn thay
+    # vì retry tiếp và bị Docker kill khi hết stop_grace_period.
+    if shutdown_requested.is_set():
+        logger.warning("Đang dừng, không retry GBFS url=%s", url)
+        raise error
 
 
 def discover_feeds():
@@ -389,6 +402,10 @@ def main():
     if args.duration is not None and args.duration <= 0:
         parser.error("--duration phải lớn hơn 0")
 
+    # Cài sớm, trước bước discovery: SIGTERM lúc khởi động cũng dừng êm.
+    stop_event = shutdown_requested
+    install_stop_handler(stop_event)
+
     if args.replay:
         for output_dir in args.replay:
             replay_poll(output_dir)
@@ -415,9 +432,6 @@ def main():
 
     if any(interval <= 0 for interval in intervals.values()):
         raise ValueError("Chu kỳ polling phải lớn hơn 0")
-
-    stop_event = threading.Event()
-    install_stop_handler(stop_event)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [

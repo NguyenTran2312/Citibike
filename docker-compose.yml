@@ -358,8 +358,10 @@ services:
     pull_policy: build
     profiles: [pipeline]
     restart: unless-stopped
-    # Room for the in-flight poll and its Kafka flush (up to 35 s) once the poller handles SIGTERM.
-    stop_grace_period: 60s
+    # On SIGTERM the poller stops retrying GBFS but finishes a poll it already fetched:
+    # Kafka flush (<= 35 s) + MinIO upload (<= ~60 s). A poll cut off later is kept in
+    # gbfs-spool for --replay (tests/integration/test_poller_shutdown.py).
+    stop_grace_period: 120s
     command: [python, -m, ingestion.gbfs.poller]
     environment:
       <<: *s3-env
@@ -372,6 +374,11 @@ services:
       GBFS_STATUS_TOPIC: gbfs.station_status
       GBFS_INFORMATION_TOPIC: gbfs.station_information
       GBFS_INVALID_TOPIC: gbfs.invalid
+    # Replaces the x-app mount list (YAML merge does not append lists); the poller only
+    # needs ingestion/. Poll directories kept for --replay must survive a recreated container.
+    volumes:
+      - ./ingestion:/app/ingestion:ro
+      - gbfs-spool:/app/data
     depends_on:
       kafka-init: {condition: service_completed_successfully}
       minio-init: {condition: service_completed_successfully}
@@ -505,3 +512,4 @@ volumes:
   grafana-data:
   airflow-db-data:
   airflow-logs:
+  gbfs-spool:
