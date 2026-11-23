@@ -39,3 +39,7 @@ và đóng consumer.
 ```bash
 python -m unittest tests.unit.test_gbfs_latest_state_consumer -v
 ```
+
+Integration test với Kafka và PostgreSQL thật (PostgreSQL dừng/chạy lại,
+consumer bị kill, replay, out-of-order, message hỏng): xem `tests/README.md`,
+mục Latest State Consumer.

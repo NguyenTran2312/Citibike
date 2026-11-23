@@ -96,7 +96,7 @@ class TestProcessMessage(unittest.TestCase):
         self.assertEqual(result, "quarantined")
         self.assertEqual(self.quarantine.send.call_args.args[1], "DATABASE_REJECTED")
 
-    def test_connection_error_is_raised_so_offset_is_not_committed(self):
+    def test_connection_error_is_raised_and_not_quarantined(self):
         self.connection.execute.side_effect = psycopg.OperationalError("down")
 
         with self.assertRaises(psycopg.OperationalError):

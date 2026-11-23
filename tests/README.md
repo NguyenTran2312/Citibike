@@ -41,3 +41,31 @@ docker compose exec -T -w /opt/project spark-master bash -c \
 ```bash
 bash tests/integration/str07_checkpoint_restart.sh
 ```
+
+### Latest State Consumer với Kafka và PostgreSQL thật (STR-05/06)
+
+`test_latest_state_recovery.py` chạy trên một Compose project riêng nên không
+đụng stack đang dùng. Cần Python trên host có `confluent-kafka`, `psycopg[binary]`
+(xem `ingestion/gbfs/requirements.txt`, `infra/python/requirements.txt`).
+
+```bash
+export COMPOSE_PROJECT_NAME=citibike-itest
+# export POSTGRES_PORT=55432   # nếu cổng 5432 trên host đã bị chiếm
+docker compose --profile pipeline build gbfs-poller
+docker compose --profile pipeline up -d --wait latest-state-consumer
+python -m unittest tests.integration.test_latest_state_recovery -v
+docker compose --profile pipeline down -v
+```
+
+| Test | Chứng minh |
+|---|---|
+| `test_1` | Message cũ hơn đến sau không ghi đè trạng thái mới hơn (out-of-order) |
+| `test_2` | Gửi lại cùng message không ghi lại dòng (`xmin` không đổi) |
+| `test_3` | PostgreSQL dừng 20 giây: offset không được commit, consumer bị Docker restart; PostgreSQL chạy lại thì consumer tự xử lý message đang chờ |
+| `test_4` | Process consumer bị SIGKILL: Docker restart, đọc tiếp từ offset đã commit, không mất message |
+| `test_5` | Message không phải JSON đi sang `gbfs.invalid` (kèm header offset gốc), consumer không bị kẹt |
+
+Thời gian chạy khoảng 75 giây. Đã kiểm tra test bắt được lỗi bằng cách cố tình
+sửa sai consumer: commit offset trước khi ghi (test_3 fail), bỏ điều kiện
+`collected_at` trong UPSERT (test_1, test_2 fail), crash khi gặp message hỏng
+(test_5 fail).
