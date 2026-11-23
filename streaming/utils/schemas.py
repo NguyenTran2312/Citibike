@@ -54,6 +54,13 @@ STATION_STATUS_SCHEMA = StructType([
 # ---------------------------------------------------------------------------
 # gbfs.station_information  -- polled every 24h, own poll_id space
 # ---------------------------------------------------------------------------
+# rental_uris (GBFS v2.3): deep links to rent at this station
+RENTAL_URIS_SCHEMA = StructType([
+    StructField("android", StringType(), True),
+    StructField("ios", StringType(), True),
+    StructField("web", StringType(), True),
+])
+
 STATION_INFORMATION_SCHEMA = StructType([
     StructField("poll_id", StringType(), True),                 # required; station_information-<uuid4>
     StructField("last_updated", LongType(), True),              # feed update time, epoch seconds
@@ -65,6 +72,9 @@ STATION_INFORMATION_SCHEMA = StructType([
     StructField("short_name", StringType(), True),              # nullable
     StructField("capacity", IntegerType(), True),               # nullable
     StructField("is_virtual_station", BooleanType(), True),     # nullable
+    StructField("region_id", StringType(), True),               # nullable (source field)
+    StructField("rental_uris", RENTAL_URIS_SCHEMA, True),       # nullable (source field)
+    StructField("is_charging", BooleanType(), True),            # nullable (source field)
 ])
 
 # ---------------------------------------------------------------------------

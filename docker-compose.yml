@@ -421,6 +421,7 @@ services:
       STATUS_CHECKPOINT_LOCATION: s3a://checkpoints/status-history/
       INFORMATION_CHECKPOINT_LOCATION: s3a://checkpoints/information-history/
       SILVER_STATUS_CHECKPOINT_LOCATION: s3a://checkpoints/silver-status/
+      SILVER_INFORMATION_CHECKPOINT_LOCATION: s3a://checkpoints/silver-information/
       STREAM_TRIGGER_INTERVAL: ${STREAM_TRIGGER_INTERVAL:-5 minutes}
     entrypoint: [/opt/spark/bin/spark-submit]
     command: [--master, 'spark://spark-master:7077', --deploy-mode, client, --conf, spark.driver.host=spark-streaming, --conf, spark.driver.bindAddress=0.0.0.0, /opt/project/streaming/jobs/gbfs_history.py]

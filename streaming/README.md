@@ -4,11 +4,13 @@
 |---|---|
 | `utils/schemas.py` | `StructType` của 3 topic `gbfs.station_status`, `gbfs.station_information`, `gbfs.invalid` (contract: `docs/contracts.md` 1.4, 1.5, 2.3.2) |
 | `jobs/gbfs_history.py` | Entry point của service `spark-streaming`: đọc Kafka → `from_json` → phân loại hợp lệ / sai schema → sink; khởi động thêm query Silver status |
-| `jobs/silver_status.py` | Bronze → `silver.gbfs_status` (STR-09): parse + validate lại `raw_value`, dedup `(station_id, poll_id)`, MERGE chỉ insert |
+| `jobs/silver.py` | Phần dùng chung Bronze → Silver: đọc Bronze incremental, parse + validate lại `raw_value`, dedup `(station_id, poll_id)`, MERGE chỉ insert |
+| `jobs/silver_status.py` | Bronze → `silver.gbfs_status` (STR-09) |
+| `jobs/silver_information.py` | Bronze → `silver.gbfs_station_information` (STR-10) |
 | `jobs/dq_checks.py` | Data-quality checks dạng SQL "đếm dòng xấu"; check `error` thất bại thì exit 1 |
 | `fixtures/gbfs/*.jsonl` | Message mẫu (mỗi dòng 1 message). `station_status_bad.jsonl`: 10 message sai, mỗi dòng một kiểu lỗi |
 
-Sink mặc định là **Bronze** (STR-08). Sink `console` dùng để debug. Dedup `(station_id, poll_id)` và lọc message sai làm ở Silver (STR-09/10). Với `--sink bronze` ở chế độ liên tục, job khởi động thêm query Silver status (tắt bằng `--no-silver`).
+Sink mặc định là **Bronze** (STR-08). Sink `console` dùng để debug. Dedup `(station_id, poll_id)` và lọc message sai làm ở Silver (STR-09/10). Với `--sink bronze` ở chế độ liên tục, job khởi động thêm một query Silver cho mỗi feed (tắt bằng `--no-silver`).
 
 Schema Spark khớp tên field với JSON Schema của producer (`ingestion/gbfs/json_schemas`). Cả hai feed đều bắt buộc có `poll_id` không rỗng; `poll_id` của information là mã lần polling information (`station_information-<uuid4>`), khác `poll_id` của status.
 
@@ -73,6 +75,32 @@ docker compose exec spark-master /opt/spark/bin/spark-submit \
 
 Hai check đối soát với Bronze chỉ có nghĩa khi Silver đã bắt kịp Bronze (ví dụ ngay sau `silver_status.py --available-now`); khi query đang chạy, Silver trễ Bronze tối đa một trigger. Layer `bronze_status` có thêm check không trùng offset.
 
+## Silver station information (STR-10)
+
+`silver.gbfs_station_information` (Trino: `iceberg.silver.gbfs_station_information`), partition `months(collected_at)`.
+
+- **Grain:** một dòng = một trạm trong một lần polling information, khóa `(station_id, poll_id)`. Mỗi lần polling (24 giờ một lần, và một lần mỗi khi poller khởi động) là một **snapshot đầy đủ** danh sách trạm, giữ nguyên như quan sát được, kể cả khi không đổi. Nhờ vậy đọc được tên, tọa độ, sức chứa, `short_name` của trạm "tại" bất kỳ lần polling nào (cần cho mapping với Trip History, scope Slide 11).
+- **Đầy đủ trường của feed nguồn:** `station_id`, `name`, `short_name`, `lat`, `lon`, `capacity`, `region_id`, `rental_uris` (`android`, `ios`, `web`), `is_charging`, cùng `is_virtual_station` (contract có, nguồn hiện không gửi, luôn null). Producer gửi đủ các trường này từ STR-10.
+- Cách validate, dedup, MERGE và checkpoint giống Silver status (`jobs/silver.py`); checkpoint `SILVER_INFORMATION_CHECKPOINT_LOCATION` = `s3a://checkpoints/silver-information/`.
+- Message information gửi trước khi có `poll_id` hoặc trước STR-10 thiếu trường: thiếu `poll_id` thì không hợp lệ và chỉ nằm ở Bronze; thiếu ba trường mới thì vẫn hợp lệ, ba trường là null.
+
+```bash
+docker compose exec spark-master /opt/spark/bin/spark-submit \
+  /opt/project/streaming/jobs/silver_information.py --available-now
+docker compose exec spark-master /opt/spark/bin/spark-submit \
+  /opt/project/streaming/jobs/dq_checks.py --layer silver_information
+```
+
+| Check `silver_information` | Mức | Ý nghĩa |
+|---|---|---|
+| `silver_information_grain_unique` | error | Không có hai dòng cùng `(station_id, poll_id)` |
+| `silver_information_has_every_valid_bronze_key` / `_only_valid_bronze_keys` | error | Silver khớp tập khóa hợp lệ của Bronze (không thiếu, không thừa) |
+| `silver_information_required_not_null` | error | `station_id`, `poll_id`, `collected_at`, `last_updated`, `name`, `lat`, `lon` không null |
+| `silver_information_coordinates_in_range` | error | `lat` trong [-90, 90], `lon` trong [-180, 180] |
+| `silver_information_capacity_non_negative` | error | `capacity` không âm |
+| `silver_information_poll_completeness` | warn | Snapshot có ít hơn 90% số trạm của snapshot lớn nhất |
+| `silver_information_short_name_present` | warn | Thiếu `short_name` (không map được với Trip History) |
+
 Đối soát Bronze với Kafka (số dòng theo partition, offset trùng, số trạm mỗi `poll_id`, số snapshot):
 
 ```bash
@@ -125,6 +153,9 @@ bash tests/integration/str08_bronze.sh
 
 # Integration STR-09: Silver dedup, idempotent khi chạy lại / mất checkpoint, DQ gate
 bash tests/integration/str09_silver.sh
+
+# Integration STR-10: Silver information đủ trường, snapshot, dedup, idempotent, DQ gate
+bash tests/integration/str10_silver_information.sh
 ```
 
 `test_matches_producer_json_schemas` so tên field với `ingestion/gbfs/json_schemas/*.schema.json` của producer; test này tự skip khi các file đó chưa có trên nhánh.
@@ -162,3 +193,13 @@ Chưa kiểm tra: đọc Bronze bằng Trino; crash giữa lúc commit Iceberg (
 
 Ghi chú: khi mất checkpoint Silver và đọc lại Bronze, MERGE không thêm dòng nhưng Iceberg vẫn ghi một snapshot rỗng.
 Chưa kiểm tra: đọc Silver bằng Trino; xóa snapshot cũ của Bronze (maintenance) khi query Silver đang chạy.
+
+### Kết quả STR-10 (23/11/2026)
+
+| Kiểm tra | Kết quả |
+|---|---|
+| Producer unit tests (`tests/unit`) | 58/58 pass (message information giữ `region_id`, `rental_uris`, `is_charging`; kiểu dữ liệu chặt) |
+| Spark unit tests (`tests/streaming`) | 42/42 pass (thêm 11 test Silver information + DQ) |
+| `tests/integration/str10_silver_information.sh` | 7/7: đủ trường; replay dedup; trạm đổi tên ở snapshot sau vẫn giữ cả hai phiên bản; message sai (lat 95, thiếu `poll_id`, không phải JSON) bị loại; chạy lại / mất checkpoint không thêm dòng; DQ exit 1 khi chèn dòng trùng |
+| `tests/integration/str09_silver.sh` (hồi quy sau khi tách `jobs/silver.py`) | 7/7 |
+| Dữ liệu thật: poller → Kafka → `spark-streaming` (Bronze + 2 query Silver), poller khởi động lại để có snapshot thứ hai | `silver.gbfs_station_information` 5038 dòng = 2 snapshot × 2519; `region_id` khác null 5014 = 2 × 2507 (12 trạm nguồn không có `region_id`), `rental_uris` và `is_charging` 5038; DQ `silver_information` 8/8 và `silver_status` 7/7 PASS |

@@ -54,6 +54,13 @@ class StationStatus(SourceModel):
         raise ValueError("Cờ hoạt động phải là 0/1 hoặc boolean")
 
 
+class RentalUris(SourceModel):
+    # GBFS 2.3: deep links để thuê xe; nguồn hiện chỉ có android/ios.
+    android: str | None = None
+    ios: str | None = None
+    web: str | None = None
+
+
 class StationInformation(SourceModel):
     station_id: NonEmptyString
     name: NonEmptyString
@@ -64,6 +71,11 @@ class StationInformation(SourceModel):
     short_name: str | None = None
     capacity: NonNegativeInt | None = None
     is_virtual_station: StrictBool | None = None
+
+    # Các trường còn lại của feed nguồn (STR-10 giữ đầy đủ các trường).
+    region_id: str | None = None
+    rental_uris: RentalUris | None = None
+    is_charging: StrictBool | None = None
 
 
 class FeedMetadata(BaseModel):

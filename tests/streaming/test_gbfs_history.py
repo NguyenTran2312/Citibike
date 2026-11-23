@@ -77,8 +77,12 @@ class ContractSchemaTest(unittest.TestCase):
             "last_updated": LongType(), "collected_at": StringType(), "station_id": StringType(),
             "name": StringType(), "lat": DoubleType(), "lon": DoubleType(),
             "short_name": StringType(), "capacity": IntegerType(),
-            "is_virtual_station": BooleanType(),
+            "is_virtual_station": BooleanType(), "region_id": StringType(),
+            "rental_uris": STATION_INFORMATION_SCHEMA["rental_uris"].dataType,
+            "is_charging": BooleanType(),
         })
+        uris = STATION_INFORMATION_SCHEMA["rental_uris"].dataType
+        self.assertEqual(uris.fieldNames(), ["android", "ios", "web"])
 
     def test_invalid_fields(self):
         self.assertFieldTypes(INVALID_SCHEMA, {
@@ -157,6 +161,10 @@ class ParseValidateTest(unittest.TestCase):
         self.assertEqual(rows[0].capacity, 17)
         self.assertIsNone(rows[1].short_name)  # nullable fields may be null
         self.assertIsNone(rows[1].capacity)
+        self.assertEqual(rows[0].region_id, "71")
+        self.assertIs(rows[0].is_charging, False)
+        self.assertEqual(rows[0].rental_uris.ios, "https://bkn.lft.to/lastmile_qr_scan")
+        self.assertIsNone(rows[1].rental_uris)
 
     def test_invalid_fixture_keeps_raw_payload_as_json_text(self):
         rows = self._validate(_fixture_lines("invalid.jsonl"), "invalid", INVALID_SCHEMA).collect()

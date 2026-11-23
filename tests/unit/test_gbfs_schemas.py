@@ -191,13 +191,14 @@ class TestGBFSSchemas(unittest.TestCase):
 
         with self.assertRaises(ValidationError):
             InvalidMessage.model_validate(row)
-    def test_information_message_has_only_requested_fields(self):
+    def test_information_message_keeps_every_source_field(self):
         result = StationInformationMessage.model_validate({
             **self.information,
             **self.metadata,
             "region_id": "71",
             "is_charging": False,
             "rental_uris": {"ios": "https://example.com"},
+            "future_source_field": "dropped",
         })
 
         exported = result.model_dump(mode="json")
@@ -213,9 +214,35 @@ class TestGBFSSchemas(unittest.TestCase):
             "short_name",
             "capacity",
             "is_virtual_station",
+            "region_id",
+            "rental_uris",
+            "is_charging",
         }
 
         self.assertEqual(set(exported), expected_fields)
+        self.assertEqual(exported["region_id"], "71")
+        self.assertIs(exported["is_charging"], False)
+        self.assertEqual(
+            exported["rental_uris"],
+            {"android": None, "ios": "https://example.com", "web": None},
+        )
+
+    def test_information_source_fields_are_optional_and_typed(self):
+        result = StationInformation.model_validate(self.information)
+        self.assertIsNone(result.region_id)
+        self.assertIsNone(result.rental_uris)
+        self.assertIsNone(result.is_charging)
+
+        for field, value in (
+            ("is_charging", "false"),
+            ("is_charging", 0),
+            ("rental_uris", "https://example.com"),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ValidationError):
+                    StationInformation.model_validate(
+                        {**self.information, field: value}
+                    )
 
     def test_information_message_requires_poll_id(self):
         metadata = {

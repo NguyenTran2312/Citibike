@@ -1,4 +1,4 @@
-"""Helper for tests/integration/str09_silver.sh (run with spark-submit).
+"""Helper for tests/integration/str09_silver.sh and str10_silver_information.sh.
 
     str09_silver_check.py <silver_table> stats              -> STR09_RESULT {...}
     str09_silver_check.py <silver_table> inject-duplicate   -> re-insert one existing row
@@ -44,6 +44,7 @@ def main() -> None:
         "keys": sorted(f"{r.station_id}/{r.poll_id}" for r in rows),
         "distinct_keys": df.select("station_id", "poll_id").distinct().count(),
         "null_collected_at": df.filter(F.col("collected_at").isNull()).count(),
+        "non_null": {c: df.filter(F.col(c).isNotNull()).count() for c in df.columns},
         "snapshots": history.size(),
     }, sort_keys=True))
 

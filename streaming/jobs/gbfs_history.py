@@ -428,7 +428,7 @@ def main() -> int:
     parser.add_argument("--available-now", action="store_true",
                         help="process the data available now, then stop (restart tests)")
     parser.add_argument("--no-silver", action="store_true",
-                        help="with --sink bronze: do not start the Silver status query")
+                        help="with --sink bronze: do not start the Silver queries")
     args = parser.parse_args()
 
     spark = build_spark()
@@ -447,15 +447,20 @@ def main() -> int:
             target = "console"
         print(f"started {feed}: {FEEDS[feed].topic} -> {target}", flush=True)
 
-    # Silver status (STR-09) reads the Bronze table incrementally in the same
-    # application. Not with --available-now: Bronze may not have committed yet, so
-    # run streaming/jobs/silver_status.py --available-now after Bronze instead.
-    if (args.sink == "bronze" and "status" in feeds and not args.available_now
-            and not args.no_silver):
+    # Silver (STR-09 status, STR-10 information) reads each Bronze table
+    # incrementally in the same application. Not with --available-now: Bronze may
+    # not have committed yet, so run silver_status.py / silver_information.py
+    # --available-now after Bronze instead.
+    if args.sink == "bronze" and not args.available_now and not args.no_silver:
+        from streaming.jobs.silver_information import (SILVER_INFORMATION_TABLE,
+                                                       start_silver_information_query)
         from streaming.jobs.silver_status import SILVER_STATUS_TABLE, start_silver_status_query
-        start_silver_status_query(spark, args.checkpoint_dir and
-                                  f"{args.checkpoint_dir.rstrip('/')}/silver_status")
-        print(f"started silver: {BRONZE_TABLES['status']} -> {SILVER_STATUS_TABLE}", flush=True)
+        silver = {"status": (start_silver_status_query, SILVER_STATUS_TABLE),
+                  "information": (start_silver_information_query, SILVER_INFORMATION_TABLE)}
+        for feed in feeds:
+            start, table = silver[feed]
+            start(spark, args.checkpoint_dir and f"{args.checkpoint_dir.rstrip('/')}/silver_{feed}")
+            print(f"started silver: {BRONZE_TABLES[feed]} -> {table}", flush=True)
 
     if args.available_now:
         for q in spark.streams.active:

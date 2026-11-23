@@ -1,4 +1,48 @@
 {
+  "$defs": {
+    "RentalUris": {
+      "properties": {
+        "android": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Android"
+        },
+        "ios": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ios"
+        },
+        "web": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Web"
+        }
+      },
+      "title": "RentalUris",
+      "type": "object"
+    }
+  },
   "description": "Message station_information: có poll_id, không có schema_version.",
   "properties": {
     "last_updated": {
@@ -74,6 +118,41 @@
       ],
       "default": null,
       "title": "Is Virtual Station"
+    },
+    "region_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Region Id"
+    },
+    "rental_uris": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RentalUris"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "is_charging": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Is Charging"
     }
   },
   "required": [

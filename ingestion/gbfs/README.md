@@ -87,6 +87,13 @@ Khóa logic của observation trạng thái là `(station_id, poll_id)`.
 | `short_name` | string hoặc null |
 | `capacity` | integer không âm hoặc null |
 | `is_virtual_station` | boolean hoặc null |
+| `region_id` | string hoặc null |
+| `rental_uris` | object `{android, ios, web}` (string hoặc null) hoặc null |
+| `is_charging` | boolean hoặc null |
+
+`region_id`, `rental_uris`, `is_charging` là các trường còn lại của feed nguồn,
+giữ lại để Silver (STR-10) có đầy đủ trường. Trường nguồn ngoài danh sách
+trên vẫn bị bỏ (chỉ còn trong raw JSON).
 
 `poll_id` là mã lần polling của chính feed information (khác `poll_id`
 của status). Message information không có `schema_version`.
