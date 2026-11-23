@@ -77,6 +77,7 @@ Khóa logic của observation trạng thái là `(station_id, poll_id)`.
 
 | Trường | Kiểu |
 |---|---|
+| `poll_id` | string |
 | `last_updated` | integer |
 | `collected_at` | datetime có timezone |
 | `station_id` | string |
@@ -87,7 +88,9 @@ Khóa logic của observation trạng thái là `(station_id, poll_id)`.
 | `capacity` | integer không âm hoặc null |
 | `is_virtual_station` | boolean hoặc null |
 
-Message chuẩn hóa không chứa `poll_id` hoặc `schema_version`.
+`poll_id` là mã lần polling của chính feed information (khác `poll_id`
+của status). Message information không có `schema_version`.
+Khóa logic của một snapshot thông tin trạm là `(station_id, poll_id)`.
 
 `is_virtual_station` phân biệt điểm đỗ không có dock thông minh
 với trạm có dock thông minh. Nếu nguồn không cung cấp, giữ null.
@@ -135,8 +138,7 @@ Message lỗi không được có trường ngoài schema đã định nghĩa.
   không chạy dồn các lần đã lỡ.
 - Mỗi lần polling có `poll_id` dạng `<feed_name>-<uuid4>`,
   hai feed không dùng chung `poll_id`.
-  Mã polling của information chỉ dùng cho đường dẫn raw,
-  không được xuất vào message chuẩn hóa.
+  `poll_id` có trong message của cả hai feed và trong đường dẫn raw.
 - Các lần polling khác nhau vẫn được ghi nhận khi trạng thái không đổi.
   Khi bổ sung replay, phải giữ nguyên metadata của observation gốc.
 
@@ -400,7 +402,7 @@ python tests/integration/check_kafka_delivery.py data/gbfs/station_information/<
 ```
 
 Đối soát kiểm tra key, nội dung và số lượng của các message hợp lệ.
-Status được nhận diện bằng poll_id; information bằng collected_at.
+Cả status và information được nhận diện bằng poll_id.
 
 ## Chạy unit tests GBFS
 
@@ -446,8 +448,9 @@ Các file được tạo trong `ingestion/gbfs/json_schemas/`.
 - Review schema với người phụ trách Data Modeling / Data Quality.
 - Đồng bộ danh sách trường mới vào contract chung của nhóm.
 - Chốt chính sách xử lý num_bikes_available = null.
-- Chốt grain và chính sách snapshot của information,
-  bao gồm việc có xuất `poll_id` của information hay không.
+- Chốt grain và chính sách snapshot của information
+  (message đã có `poll_id`; message information gửi trước khi thêm
+  trường này không có `poll_id`).
 - Chốt có giữ thêm các trường nguồn đang bị loại
   (ví dụ `num_bikes_disabled`, `num_ebikes_available`, `region_id`)
   trước khi làm Spark Kafka Source (STR-07).

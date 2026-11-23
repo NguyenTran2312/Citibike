@@ -71,9 +71,13 @@ class FeedMetadata(BaseModel):
     collected_at: AwareDatetime
 
 
-class ObservationMetadata(FeedMetadata):
-    # Metadata dành riêng cho station_status.
+class PollMetadata(FeedMetadata):
+    # Mã lần polling; mỗi feed có mã riêng, không dùng chung.
     poll_id: NonEmptyString
+
+
+class ObservationMetadata(PollMetadata):
+    # Metadata dành riêng cho station_status.
     schema_version: Literal[1] = 1
 
     @field_validator("schema_version", mode="before")
@@ -89,8 +93,8 @@ class StationStatusMessage(StationStatus, ObservationMetadata):
     """Message station_status chuẩn hóa."""
 
 
-class StationInformationMessage(StationInformation, FeedMetadata):
-    """Message station_information không có poll_id/schema_version."""
+class StationInformationMessage(StationInformation, PollMetadata):
+    """Message station_information: có poll_id, không có schema_version."""
 
 
 class InvalidMessage(BaseModel):

@@ -203,6 +203,7 @@ class TestGBFSSchemas(unittest.TestCase):
         exported = result.model_dump(mode="json")
 
         expected_fields = {
+            "poll_id",
             "last_updated",
             "collected_at",
             "station_id",
@@ -215,6 +216,30 @@ class TestGBFSSchemas(unittest.TestCase):
         }
 
         self.assertEqual(set(exported), expected_fields)
+
+    def test_information_message_requires_poll_id(self):
+        metadata = {
+            k: v for k, v in self.metadata.items()
+            if k != "schema_version"
+        }
+
+        result = StationInformationMessage.model_validate({
+            **self.information, **metadata,
+        })
+        self.assertEqual(result.poll_id, "status-test-poll-01")
+
+        for value in (None, ""):
+            with self.subTest(poll_id=value):
+                with self.assertRaises(ValidationError):
+                    StationInformationMessage.model_validate({
+                        **self.information, **metadata, "poll_id": value,
+                    })
+
+        del metadata["poll_id"]
+        with self.assertRaises(ValidationError):
+            StationInformationMessage.model_validate({
+                **self.information, **metadata,
+            })
 
     def test_status_version_must_be_integer_one(self):
         for value in (0, 2, True, "1", 1.0):

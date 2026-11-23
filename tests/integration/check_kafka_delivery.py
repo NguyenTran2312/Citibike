@@ -3,7 +3,6 @@ import json
 import os
 import time
 from collections import Counter
-from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -56,17 +55,8 @@ def main():
     received = Counter()
 
     def belongs_to_this_poll(payload):
-        if feed_name == "station_status":
-            return payload.get("poll_id") == raw["poll_id"]
-
-        # Information không có poll_id trong message chuẩn hóa.
-        collected_at = payload.get("collected_at")
-        if not collected_at:
-            return False
-
-        return datetime.fromisoformat(
-            collected_at
-        ) == datetime.fromisoformat(raw["collected_at"])
+        # Cả status và information đều mang poll_id của lần polling.
+        return payload.get("poll_id") == raw["poll_id"]
 
     consumer = Consumer({
         "bootstrap.servers": os.getenv(

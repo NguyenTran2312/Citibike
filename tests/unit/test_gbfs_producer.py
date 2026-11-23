@@ -62,6 +62,7 @@ class TestGBFSProducer(unittest.TestCase):
             "name": "Test Station",
             "lat": 40.75,
             "lon": -73.98,
+            "poll_id": "station_information-test-poll",
             "last_updated": 1794891057,
             "collected_at": "2026-11-17T05:00:00Z",
         }
@@ -76,7 +77,7 @@ class TestGBFSProducer(unittest.TestCase):
         payload = json.loads(sent["value"])
 
         self.assertEqual(sent["key"], b"test-station")
-        self.assertNotIn("poll_id", payload)
+        self.assertEqual(payload["poll_id"], "station_information-test-poll")
         self.assertNotIn("schema_version", payload)
         self.assertIn("is_virtual_station", payload)
         self.assertIsNone(payload["is_virtual_station"])

@@ -17,9 +17,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pydantic import ValidationError
 
 from ingestion.gbfs.schemas import (
-    FeedMetadata,
     InvalidMessage,
     ObservationMetadata,
+    PollMetadata,
     StationInformationMessage,
     StationStatusMessage,
 )
@@ -230,7 +230,7 @@ def write_messages(feed_name, payload, poll_id, collected_at, output_dir):
             schema_version=1,
         )
     else:
-        metadata = FeedMetadata(**feed_metadata)
+        metadata = PollMetadata(**feed_metadata, poll_id=poll_id)
 
     rows = payload["data"]["stations"]
     if not isinstance(rows, list):

@@ -1,5 +1,5 @@
 {
-  "description": "Message station_information không có poll_id/schema_version.",
+  "description": "Message station_information: có poll_id, không có schema_version.",
   "properties": {
     "last_updated": {
       "minimum": 0,
@@ -9,6 +9,11 @@
     "collected_at": {
       "format": "date-time",
       "title": "Collected At",
+      "type": "string"
+    },
+    "poll_id": {
+      "minLength": 1,
+      "title": "Poll Id",
       "type": "string"
     },
     "station_id": {
@@ -74,6 +79,7 @@
   "required": [
     "last_updated",
     "collected_at",
+    "poll_id",
     "station_id",
     "name",
     "lat",
