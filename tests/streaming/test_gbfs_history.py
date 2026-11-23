@@ -73,6 +73,7 @@ class ContractSchemaTest(unittest.TestCase):
 
     def test_station_information_fields(self):
         self.assertFieldTypes(STATION_INFORMATION_SCHEMA, {
+            "poll_id": StringType(),
             "last_updated": LongType(), "collected_at": StringType(), "station_id": StringType(),
             "name": StringType(), "lat": DoubleType(), "lon": DoubleType(),
             "short_name": StringType(), "capacity": IntegerType(),
@@ -151,6 +152,7 @@ class ParseValidateTest(unittest.TestCase):
         rows = self._validate(_fixture_lines("station_information.jsonl"), "information",
                               STATION_INFORMATION_SCHEMA).orderBy("station_id").collect()
         self.assertEqual([r.dq_is_valid for r in rows], [True, True])
+        self.assertEqual(rows[0].poll_id, "station_information-20261116T000000Z")
         self.assertAlmostEqual(rows[0].lat, 40.7128)
         self.assertEqual(rows[0].capacity, 17)
         self.assertIsNone(rows[1].short_name)  # nullable fields may be null
@@ -206,6 +208,8 @@ class ParseValidateTest(unittest.TestCase):
     def test_information_invalid_cases(self):
         cases = [
             (_valid_information(name=None), "missing name"),
+            (_valid_information(poll_id=None), "missing poll_id"),
+            (_valid_information(poll_id=""), "empty poll_id"),
             (_valid_information(lat=91.0), "lat out of range"),
             (_valid_information(lon=-181.0), "lon out of range"),
             (_valid_information(capacity=-1), "negative capacity"),

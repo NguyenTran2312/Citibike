@@ -8,6 +8,8 @@
 
 Hiện tại (STR-07) job chỉ có sink `console`. Sink Iceberg (dedup `(station_id, poll_id)`, dùng `STATUS_/INFORMATION_CHECKPOINT_LOCATION`) làm ở issue sau.
 
+Schema Spark khớp tên field với JSON Schema của producer (`ingestion/gbfs/json_schemas`). Cả hai feed đều bắt buộc có `poll_id` không rỗng; `poll_id` của information là mã lần polling information (`station_information-<uuid4>`), khác `poll_id` của status.
+
 ## Phân loại message
 
 `validate()` thêm 3 cột `dq_is_valid`, `dq_error_type`, `dq_error_message`:
@@ -55,3 +57,15 @@ bash tests/integration/str07_checkpoint_restart.sh
 ```
 
 `test_matches_producer_json_schemas` so tên field với `ingestion/gbfs/json_schemas/*.schema.json` của producer; test này tự skip khi các file đó chưa có trên nhánh.
+
+### Kết quả đã ghi nhận (23/11/2026)
+
+| Kiểm tra | Kết quả |
+|---|---|
+| Unit + contract tests (`tests/streaming`) | 14/14 pass, gồm so field với JSON Schema của producer |
+| `--fixture` (qua `spark-defaults.conf` thật) | PASSED |
+| `tests/integration/str07_checkpoint_restart.sh` | 3/3: lần đầu đọc đủ 2 valid + 10 invalid; restart chỉ đọc 2 message mới; restart không có message mới thì không đọc lại gì |
+| Dữ liệu thật: `gbfs-poller` (GBFS API) → Kafka → job `--available-now` | `status` 2519 valid / 0 invalid; `information` 2519 valid / 0 invalid |
+| Service `spark-streaming` (client mode lên `spark-master` + `spark-worker`) | Batch 0 của mỗi feed: 2519 valid / 0 invalid |
+
+Các lần chạy dùng một Compose project riêng (`COMPOSE_PROJECT_NAME=citibike-itest`, đổi cổng MinIO/Iceberg REST/Spark UI) để không đụng stack đang dùng.

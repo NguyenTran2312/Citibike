@@ -109,8 +109,8 @@ def status_rules() -> List[Rule]:
 
 def information_rules() -> List[Rule]:
     return (
-        _required("last_updated", "collected_at", "station_id", "name", "lat", "lon")
-        + _non_empty("station_id", "name")
+        _required("poll_id", "last_updated", "collected_at", "station_id", "name", "lat", "lon")
+        + _non_empty("poll_id", "station_id", "name")
         + _non_negative("last_updated", "capacity")
         + _iso_datetime_with_tz("collected_at")
         + [((F.col("lat") < -90) | (F.col("lat") > 90), "lat out of range [-90, 90]"),
