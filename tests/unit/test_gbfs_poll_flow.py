@@ -84,31 +84,102 @@ class TestPollFeedFlow(unittest.TestCase):
         self.assertTrue((output_dir / "valid.jsonl").exists())
         self.calls.publish.assert_not_called()
 
-    def test_archive_failure_does_not_fail_the_poll(self):
+    def poll_failing(self, error, **env):
+        """Lần polling lỗi: phải báo lỗi và log việc giữ lại thư mục."""
+        with self.assertLogs("ingestion.gbfs.poller", level="WARNING") as logs:
+            with self.assertRaises(error):
+                self.poll(**env)
+        self.assertIn("Giữ lại", "\n".join(logs.output))
+
+    def kept_dir(self):
+        kept = list(self.data_dir.glob("station_status/*"))
+        self.assertEqual(len(kept), 1)
+        return kept[0]
+
+    def test_archive_failure_does_not_fail_the_poll_and_keeps_files(self):
         self.calls.archive.side_effect = ConnectionError("MinIO down")
 
         with self.assertLogs("ingestion.gbfs.poller", level="ERROR") as logs:
-            self.poll()
+            output_dir = self.poll()
 
         self.calls.publish.assert_called_once()
         self.assertIn("Raw archive thất bại", "\n".join(logs.output))
+        # Raw chưa có trên MinIO: bản trên máy là bản đầy đủ duy nhất.
+        self.assertTrue((output_dir / "raw.json").exists())
 
-    def test_kafka_failure_still_archives_raw_and_cleans_up(self):
+    def test_kafka_failure_archives_raw_and_keeps_files_for_replay(self):
         self.calls.publish.side_effect = RuntimeError("Kafka down")
 
-        with self.assertRaises(RuntimeError):
-            self.poll()
+        self.poll_failing(RuntimeError)
 
         self.calls.archive.assert_called_once()
-        self.assertEqual(list(self.data_dir.rglob("*.json*")), [])
+        kept = self.kept_dir()
+        self.assertTrue((kept / "valid.jsonl").exists())
+        self.assertFalse((kept / "kafka_delivery.json").exists())
 
-    def test_malformed_feed_is_still_archived(self):
+    def test_kafka_and_minio_failure_does_not_delete_the_only_copy(self):
+        self.calls.publish.side_effect = RuntimeError("Kafka down")
+        self.calls.archive.side_effect = ConnectionError("MinIO down")
+
+        self.poll_failing(RuntimeError)
+
+        self.assertTrue((self.kept_dir() / "raw.json").exists())
+
+    def test_kafka_failure_without_archive_keeps_files(self):
+        self.calls.publish.side_effect = RuntimeError("Kafka down")
+
+        self.poll_failing(RuntimeError, GBFS_ARCHIVE_RAW="false")
+
+        self.calls.archive.assert_not_called()
+        self.assertTrue((self.kept_dir() / "raw.json").exists())
+
+    def test_malformed_feed_is_archived_and_kept(self):
         with patch("ingestion.gbfs.poller.fetch_json", return_value={"data": {}}):
-            with self.assertRaises(KeyError):
-                self.poll()
+            self.poll_failing(KeyError)
 
         self.calls.publish.assert_not_called()
         self.calls.archive.assert_called_once()
+        self.assertTrue((self.kept_dir() / "raw.json").exists())
+
+    def replay(self, output_dir):
+        with patch.dict("os.environ", self.env):
+            poller.replay_poll(output_dir)
+
+    def test_replay_republishes_with_the_original_poll_id(self):
+        self.calls.publish.side_effect = RuntimeError("Kafka down")
+        self.poll_failing(RuntimeError)
+        kept = self.kept_dir()
+
+        self.calls.publish.side_effect = None
+        self.replay(kept)
+
+        self.assertEqual(self.calls.publish.call_count, 2)
+        self.assertEqual(
+            self.calls.publish.call_args.args, ("station_status", kept)
+        )
+        archived_poll_id = self.calls.archive.call_args.args[2]
+        self.assertEqual(archived_poll_id, kept.name)
+        self.assertFalse(kept.exists())
+
+    def test_replay_skips_kafka_when_already_delivered(self):
+        self.calls.archive.side_effect = ConnectionError("MinIO down")
+        with self.assertLogs("ingestion.gbfs.poller", level="ERROR"):
+            self.poll()
+        kept = self.kept_dir()
+
+        self.calls.archive.side_effect = None
+        self.replay(kept)
+
+        self.calls.publish.assert_called_once()
+        self.assertEqual(self.calls.archive.call_count, 2)
+        self.assertFalse(kept.exists())
+
+    def test_replay_rejects_a_malformed_feed_directory(self):
+        with patch("ingestion.gbfs.poller.fetch_json", return_value={"data": {}}):
+            self.poll_failing(KeyError)
+
+        with self.assertRaises(ValueError):
+            self.replay(self.kept_dir())
 
 
 class TestStopHandler(unittest.TestCase):

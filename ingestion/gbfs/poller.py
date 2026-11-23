@@ -117,25 +117,91 @@ def poll_feed(feed_name, source_url):
         encoding="utf-8",
     )
 
-    publish_enabled = _enabled("GBFS_PUBLISH_KAFKA")
-
     try:
         write_messages(feed_name, payload, poll_id, collected_at, output_dir)
-
-        if publish_enabled:
-            publish_to_kafka(feed_name, poll_id, output_dir)
-    finally:
-        # Raw được lưu sau Kafka và cả khi bước trên lỗi (ví dụ feed sai
-        # cấu trúc), để MinIO không chặn dữ liệu realtime.
+    except Exception:
+        # Feed sai cấu trúc: không có message để gửi. Vẫn lưu raw và giữ
+        # thư mục để kiểm tra.
         if _enabled("GBFS_ARCHIVE_RAW"):
             archive_raw(raw_path, feed_name, poll_id, collected_at)
+        logger.warning("Giữ lại %s: feed không xử lý được", output_dir)
+        raise
 
-        # Khi đã gửi Kafka, file trên máy chỉ là bản tạm: xóa để không
-        # đầy đĩa. Giữ lại bằng GBFS_KEEP_LOCAL=true khi cần đối soát.
-        if publish_enabled and not _enabled("GBFS_KEEP_LOCAL"):
-            shutil.rmtree(output_dir, ignore_errors=True)
-
+    finish_poll(
+        feed_name,
+        poll_id,
+        collected_at,
+        output_dir,
+        publish=_enabled("GBFS_PUBLISH_KAFKA"),
+    )
     return output_dir
+
+
+def finish_poll(feed_name, poll_id, collected_at, output_dir, publish):
+    """Gửi Kafka, lưu raw lên MinIO rồi dọn thư mục của lần polling.
+
+    Kafka chạy trước và MinIO lỗi chỉ được log, để MinIO không chặn dữ liệu
+    realtime. Thư mục chỉ bị xóa khi mọi bước đã bật đều thành công; nếu
+    không, nó là bản sao duy nhất và được giữ lại để replay (--replay).
+    """
+    publish_error = None
+    already_delivered = (output_dir / "kafka_delivery.json").exists()
+
+    if publish and not already_delivered:
+        try:
+            publish_to_kafka(feed_name, poll_id, output_dir)
+        except Exception as error:
+            publish_error = error
+
+    archive_enabled = _enabled("GBFS_ARCHIVE_RAW")
+    archived = archive_enabled and archive_raw(
+        output_dir / "raw.json", feed_name, poll_id, collected_at
+    ) is not None
+
+    complete = (
+        publish_error is None
+        and (archived or not archive_enabled)
+    )
+
+    # Khi gửi Kafka, file trên máy chỉ là bản tạm. Giữ lại bằng
+    # GBFS_KEEP_LOCAL=true khi cần đối soát.
+    if publish and not _enabled("GBFS_KEEP_LOCAL"):
+        if complete:
+            shutil.rmtree(output_dir, ignore_errors=True)
+        else:
+            logger.warning(
+                "Giữ lại %s để replay: kafka=%s archive=%s",
+                output_dir,
+                "lỗi" if publish_error is not None else "ok",
+                "lỗi" if archive_enabled and not archived else "ok",
+            )
+
+    if publish_error is not None:
+        raise publish_error
+
+
+def replay_poll(output_dir):
+    """Gửi lại một thư mục polling đã bị giữ lại, với đúng poll_id cũ."""
+    output_dir = Path(output_dir)
+    feed_name = output_dir.parent.name
+
+    if feed_name not in MODELS:
+        raise ValueError(f"Thư mục không thuộc feed được hỗ trợ: {output_dir}")
+    if not (output_dir / "valid.jsonl").exists():
+        raise ValueError(
+            f"{output_dir} không có valid.jsonl (feed lỗi), không replay được"
+        )
+
+    raw = json.loads((output_dir / "raw.json").read_text(encoding="utf-8"))
+    logger.info("Replay feed=%s poll_id=%s", feed_name, raw["poll_id"])
+
+    finish_poll(
+        feed_name,
+        raw["poll_id"],
+        datetime.fromisoformat(raw["collected_at"]),
+        output_dir,
+        publish=True,
+    )
 
 
 def write_messages(feed_name, payload, poll_id, collected_at, output_dir):
@@ -310,10 +376,23 @@ def main():
         help="Thời gian chạy thử, tính bằng giây",
     )
 
+    parser.add_argument(
+        "--replay",
+        nargs="+",
+        metavar="DIR",
+        help="Gửi lại các thư mục polling đã bị giữ lại "
+             "(data/gbfs/<feed>/<poll_id>) rồi thoát",
+    )
+
     args = parser.parse_args()
 
     if args.duration is not None and args.duration <= 0:
         parser.error("--duration phải lớn hơn 0")
+
+    if args.replay:
+        for output_dir in args.replay:
+            replay_poll(output_dir)
+        return
 
     feeds = discover_feeds()
 

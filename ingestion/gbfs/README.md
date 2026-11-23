@@ -151,7 +151,10 @@ Message lỗi không được có trường ngoài schema đã định nghĩa.
    Bước này chạy sau Kafka và chạy cả khi bước 3–4 lỗi;
    MinIO lỗi chỉ được log, không làm lần polling thất bại.
 6. Nếu đã bật gửi Kafka và không đặt `GBFS_KEEP_LOCAL=true`:
-   xóa thư mục đầu ra của lần polling.
+   xóa thư mục đầu ra **chỉ khi mọi bước đã bật đều thành công**
+   (Kafka xác nhận, và upload MinIO nếu có bật). Nếu không, thư mục
+   được giữ lại, log ghi `Giữ lại ... để replay`, và có thể gửi lại
+   bằng `--replay` (xem mục Replay).
 
 ### Biến cấu hình
 
@@ -208,7 +211,9 @@ docker compose --profile pipeline stop gbfs-poller
 ```
 
 File đầu ra trong container nằm ở `/app/data/gbfs/`, không được mount
-ra máy host và bị xóa sau mỗi lần polling (xem `GBFS_KEEP_LOCAL`).
+ra máy host. Thư mục bị xóa sau mỗi lần polling thành công; thư mục của
+lần polling lỗi được giữ lại để replay nhưng sẽ mất khi container bị tạo
+lại (`docker compose down`/`up --force-recreate`).
 
 ### Cách 2 — Trên máy host, chỉ ghi file
 
@@ -270,8 +275,29 @@ Mỗi lần thu thập lưu tại:
 
 Thư mục `data/` không được commit lên GitHub.
 Mỗi lần polling `station_status` chiếm khoảng 2,8 MB. Khi gửi Kafka,
-thư mục được xóa ngay sau lần polling (kể cả khi lỗi) trừ khi đặt
-`GBFS_KEEP_LOCAL=true`; khi không gửi Kafka, file được giữ lại.
+thư mục chỉ bị xóa nếu lần polling thành công trọn vẹn (trừ khi đặt
+`GBFS_KEEP_LOCAL=true`); thư mục của lần polling lỗi được giữ lại, nên
+dung lượng chỉ tăng trong thời gian Kafka hoặc MinIO gặp sự cố.
+Khi không gửi Kafka, file luôn được giữ lại.
+
+## Replay thư mục polling bị giữ lại
+
+```bash
+# Trong container (biến Kafka/MinIO đã có sẵn):
+docker compose --profile pipeline exec gbfs-poller \
+  python -m ingestion.gbfs.poller --replay /app/data/gbfs/station_status/<poll_id>
+
+# Liệt kê các thư mục đang bị giữ lại:
+docker compose --profile pipeline exec gbfs-poller ls /app/data/gbfs/station_status
+```
+
+- Gửi lại `valid.jsonl` và `invalid.jsonl` với **đúng `poll_id` cũ**;
+  UPSERT ở PostgreSQL và dedup `(station_id, poll_id)` ở Silver
+  nên gửi lại không tạo bản ghi trùng.
+- Bỏ qua bước Kafka nếu thư mục đã có `kafka_delivery.json`
+  (trường hợp chỉ MinIO lỗi), rồi upload lại raw nếu `GBFS_ARCHIVE_RAW=true`.
+- Thành công trọn vẹn thì thư mục bị xóa; lỗi thì thư mục vẫn được giữ.
+- Thư mục của feed sai cấu trúc (không có `valid.jsonl`) không replay được.
 
 ## Lưu raw JSON lên MinIO (STR-04)
 
@@ -375,12 +401,13 @@ Status được nhận diện bằng poll_id; information bằng collected_at.
 python -m unittest discover -s tests/unit -p "test_gbfs*.py" -v
 ```
 
-Kết quả đã ghi nhận: 49 tests thành công
+Kết quả đã ghi nhận: 54 tests thành công
 (cần thêm `psycopg[binary]` cho test của consumer).
 
 Các test kiểm tra schema, logic vòng polling, retry khi gọi API,
-producer với Kafka client giả lập, thứ tự Kafka → MinIO, dọn file
-tạm, SIGTERM và cách Latest State Consumer cách ly message hỏng.
+producer với Kafka client giả lập, thứ tự Kafka → MinIO, chỉ dọn file
+khi lần polling thành công, replay, SIGTERM và cách Latest State
+Consumer cách ly message hỏng.
 
 Chu kỳ 24 giờ được kiểm tra phép tính thời gian bằng đồng hồ giả;
 chưa chạy kiểm thử thực tế kéo dài 24 giờ.
@@ -398,12 +425,12 @@ Các file được tạo trong `ingestion/gbfs/json_schemas/`.
 ## Hạn chế đã biết
 
 - Nếu gửi Kafka thất bại giữa chừng, một phần message có thể đã được ghi;
-  chưa có cơ chế tự replay thư mục polling cũ hoặc bảo đảm
-  exactly-once cho toàn bộ pipeline.
-- Nếu poller bị buộc dừng (SIGKILL, hết `stop_grace_period`),
-  lần polling đang chạy bị mất; lần sau cập nhật lại trạng thái mới nhất,
-  lịch sử thiếu một observation. Không có cơ chế replay thư mục cũ.
-- Nếu MinIO lỗi, raw của lần polling đó không được lưu và không upload bù.
+  replay gửi lại cả lần polling (at-least-once), phía sau phải dedup.
+- Replay chạy thủ công bằng `--replay`, chưa tự động.
+- Nếu poller bị buộc dừng (SIGKILL, hết `stop_grace_period`), thư mục
+  của lần polling đang chạy còn lại nếu `raw.json` đã được ghi và
+  container chưa bị tạo lại; replay thủ công được nếu đã có `valid.jsonl`.
+- Thư mục `/app/data` trong container chưa được mount ra volume.
 - Khi hết số lần retry, lỗi chỉ được ghi log, chưa phát alert.
 - Chưa có unit test cho `raw_storage.py`.
 
