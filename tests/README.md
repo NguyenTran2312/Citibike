@@ -41,6 +41,7 @@ docker compose exec -T -w /opt/project spark-master bash -c \
 ```bash
 bash tests/integration/str07_checkpoint_restart.sh
 bash tests/integration/str08_bronze.sh   # Bronze: rows == Kafka end offset mỗi partition, restart không trùng
+bash tests/integration/str09_silver.sh   # Silver: dedup, chạy lại / mất checkpoint không trùng, DQ gate bắt lỗi
 ```
 
 ### Latest State Consumer với Kafka và PostgreSQL thật (STR-05/06)

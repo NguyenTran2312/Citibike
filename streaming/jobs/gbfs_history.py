@@ -183,11 +183,12 @@ def read_kafka(spark: SparkSession, topic: str) -> DataFrame:
 
 
 # --- Parse and validate (pure DataFrame -> DataFrame, also used by tests) -----
-def parse_value(df: DataFrame, schema: StructType) -> DataFrame:
+def parse_value(df: DataFrame, schema: StructType, keep: Tuple[str, ...] = ()) -> DataFrame:
     """from_json on `value`. Works on Kafka (binary value) and text DataFrames.
 
     Output: Kafka metadata (if present), every schema field, `_corrupt_record`
-    (raw text when from_json could not map it to the schema) and `raw_value`.
+    (raw text when from_json could not map it to the schema), `raw_value`, and the
+    input columns named in `keep` (passed through unchanged).
     """
     value_str = F.col("value").cast("string")
     parse_schema = StructType(schema.fields + [StructField(CORRUPT_COL, StringType(), True)])
@@ -203,10 +204,12 @@ def parse_value(df: DataFrame, schema: StructType) -> DataFrame:
             meta.append(F.col("key").cast("string").alias("kafka_key"))
     parsed = df.select(
         *meta,
+        *[F.col(c) for c in keep],
         F.from_json(value_str, parse_schema, {"columnNameOfCorruptRecord": CORRUPT_COL}).alias("e"),
         value_str.alias("raw_value"),
     )
-    return parsed.select(*[c for c in KAFKA_META if c in parsed.columns], "e.*", "raw_value")
+    return parsed.select(*[c for c in KAFKA_META if c in parsed.columns], *keep,
+                         "e.*", "raw_value")
 
 
 def validate(parsed: DataFrame, feed: str) -> DataFrame:
@@ -424,6 +427,8 @@ def main() -> int:
                              "dir, so it restarts from STARTING_OFFSETS.")
     parser.add_argument("--available-now", action="store_true",
                         help="process the data available now, then stop (restart tests)")
+    parser.add_argument("--no-silver", action="store_true",
+                        help="with --sink bronze: do not start the Silver status query")
     args = parser.parse_args()
 
     spark = build_spark()
@@ -441,6 +446,16 @@ def main() -> int:
             start_console_query(spark, feed, args.checkpoint_dir, args.available_now)
             target = "console"
         print(f"started {feed}: {FEEDS[feed].topic} -> {target}", flush=True)
+
+    # Silver status (STR-09) reads the Bronze table incrementally in the same
+    # application. Not with --available-now: Bronze may not have committed yet, so
+    # run streaming/jobs/silver_status.py --available-now after Bronze instead.
+    if (args.sink == "bronze" and "status" in feeds and not args.available_now
+            and not args.no_silver):
+        from streaming.jobs.silver_status import SILVER_STATUS_TABLE, start_silver_status_query
+        start_silver_status_query(spark, args.checkpoint_dir and
+                                  f"{args.checkpoint_dir.rstrip('/')}/silver_status")
+        print(f"started silver: {BRONZE_TABLES['status']} -> {SILVER_STATUS_TABLE}", flush=True)
 
     if args.available_now:
         for q in spark.streams.active:

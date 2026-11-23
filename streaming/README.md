@@ -3,10 +3,12 @@
 | File | Vai trò |
 |---|---|
 | `utils/schemas.py` | `StructType` của 3 topic `gbfs.station_status`, `gbfs.station_information`, `gbfs.invalid` (contract: `docs/contracts.md` 1.4, 1.5, 2.3.2) |
-| `jobs/gbfs_history.py` | Entry point của service `spark-streaming`: đọc Kafka → `from_json` → phân loại hợp lệ / sai schema → sink |
+| `jobs/gbfs_history.py` | Entry point của service `spark-streaming`: đọc Kafka → `from_json` → phân loại hợp lệ / sai schema → sink; khởi động thêm query Silver status |
+| `jobs/silver_status.py` | Bronze → `silver.gbfs_status` (STR-09): parse + validate lại `raw_value`, dedup `(station_id, poll_id)`, MERGE chỉ insert |
+| `jobs/dq_checks.py` | Data-quality checks dạng SQL "đếm dòng xấu"; check `error` thất bại thì exit 1 |
 | `fixtures/gbfs/*.jsonl` | Message mẫu (mỗi dòng 1 message). `station_status_bad.jsonl`: 10 message sai, mỗi dòng một kiểu lỗi |
 
-Sink mặc định là **Bronze** (STR-08). Sink `console` dùng để debug. Dedup `(station_id, poll_id)` và lọc message sai làm ở Silver (STR-09/10).
+Sink mặc định là **Bronze** (STR-08). Sink `console` dùng để debug. Dedup `(station_id, poll_id)` và lọc message sai làm ở Silver (STR-09/10). Với `--sink bronze` ở chế độ liên tục, job khởi động thêm query Silver status (tắt bằng `--no-silver`).
 
 Schema Spark khớp tên field với JSON Schema của producer (`ingestion/gbfs/json_schemas`). Cả hai feed đều bắt buộc có `poll_id` không rỗng; `poll_id` của information là mã lần polling information (`station_information-<uuid4>`), khác `poll_id` của status.
 
@@ -37,6 +39,39 @@ Message sai được đưa về đúng dạng `gbfs.invalid` (`source, error_typ
 - Partition theo `days(ingested_at)`. Iceberg format v2.
 - Exactly-once: mỗi micro-batch là một commit Iceberg, offset Kafka nằm trong checkpoint của query. Restart không đọc lại batch đã commit.
 - Mỗi feed một query, một checkpoint riêng. **Không** dùng chung checkpoint giữa Bronze và console.
+
+## Silver status (STR-09)
+
+`silver.gbfs_status` (Trino: `iceberg.silver.gbfs_status`), partition `days(collected_at)`.
+
+- **Grain:** một dòng = một trạm tại một lần polling, khóa `(station_id, poll_id)`. Lần polling mà trạm không đổi trạng thái vẫn là một dòng mới.
+- **Nguồn:** đọc `bronze.gbfs_status` incremental (Iceberg streaming source), checkpoint `SILVER_STATUS_CHECKPOINT_LOCATION` = `s3a://checkpoints/silver-status/`. Checkpoint này **phải nằm trên S3/MinIO**: Iceberg source ghi offset bằng S3FileIO của bảng.
+- **Validation:** parse + validate lại `raw_value` bằng cùng schema và luật của STR-07 (không tin cờ `dq_is_valid` đã lưu ở Bronze), nên đổi luật thì dựng lại Silver từ Bronze được. Message sai chỉ nằm ở Bronze.
+- **Dedup:** message phát lại cùng `(station_id, poll_id)` (producer retry, `--replay`) chỉ còn một dòng; giữ Kafka offset nhỏ nhất.
+- **Idempotent:** `MERGE ... WHEN NOT MATCHED THEN INSERT *` theo `(station_id, poll_id, collected_at)`. Micro-batch chạy lại, hoặc mất checkpoint Silver rồi đọc lại toàn bộ Bronze, không thêm dòng trùng. Khoảng `collected_at` của batch được đưa vào điều kiện MERGE để Iceberg chỉ quét các partition liên quan.
+- `last_updated`, `last_reported` (epoch giây) và `collected_at` được đổi sang `TIMESTAMP` UTC, giữ riêng từng cột. Cột lineage: `kafka_partition`, `kafka_offset`, `bronze_ingested_at`, `silver_processed_at`.
+
+```bash
+# Chạy bù Silver từ Bronze rồi dừng (thủ công / Airflow / test)
+docker compose exec spark-master /opt/spark/bin/spark-submit \
+  /opt/project/streaming/jobs/silver_status.py --available-now
+
+# Data-quality gate (exit 1 khi có check error thất bại)
+docker compose exec spark-master /opt/spark/bin/spark-submit \
+  /opt/project/streaming/jobs/dq_checks.py --layer silver_status
+```
+
+| Check `silver_status` | Mức | Ý nghĩa |
+|---|---|---|
+| `silver_status_grain_unique` | error | Không có hai dòng cùng `(station_id, poll_id)` |
+| `silver_status_required_not_null` | error | Các cột bắt buộc không null |
+| `silver_status_counts_non_negative` | error | Số xe, số dock không âm |
+| `silver_status_has_every_valid_bronze_key` | error | Mọi khóa hợp lệ ở Bronze đều có ở Silver (không mất) |
+| `silver_status_only_valid_bronze_keys` | error | Silver không có khóa mà Bronze không coi là hợp lệ |
+| `silver_status_poll_completeness` | warn | Lần polling có ít hơn 90% số trạm của lần lớn nhất |
+| `silver_status_last_reported_not_after_collected` | warn | `last_reported` sau `collected_at` |
+
+Hai check đối soát với Bronze chỉ có nghĩa khi Silver đã bắt kịp Bronze (ví dụ ngay sau `silver_status.py --available-now`); khi query đang chạy, Silver trễ Bronze tối đa một trigger. Layer `bronze_status` có thêm check không trùng offset.
 
 Đối soát Bronze với Kafka (số dòng theo partition, offset trùng, số trạm mỗi `poll_id`, số snapshot):
 
@@ -87,6 +122,9 @@ bash tests/integration/str07_checkpoint_restart.sh
 # Integration STR-08: Bronze khớp end offset Kafka, restart không trùng/không sót
 # (topic, bảng, checkpoint riêng, tự xoá sau khi chạy)
 bash tests/integration/str08_bronze.sh
+
+# Integration STR-09: Silver dedup, idempotent khi chạy lại / mất checkpoint, DQ gate
+bash tests/integration/str09_silver.sh
 ```
 
 `test_matches_producer_json_schemas` so tên field với `ingestion/gbfs/json_schemas/*.schema.json` của producer; test này tự skip khi các file đó chưa có trên nhánh.
@@ -113,3 +151,14 @@ Các lần chạy dùng một Compose project riêng (`COMPOSE_PROJECT_NAME=citi
 | Dữ liệu thật: `gbfs-poller` → Kafka → service `spark-streaming` (checkpoint `s3a://checkpoints/...`), có restart service giữa chừng | `bronze.gbfs_status`: 4 lần polling, 10076 dòng = tổng end offset Kafka (3368 + 3428 + 3280), 0 offset trùng, mỗi `poll_id` đủ 2519 trạm. `bronze.gbfs_station_information`: 2519 dòng = end offset (842 + 857 + 820) |
 
 Chưa kiểm tra: đọc Bronze bằng Trino; crash giữa lúc commit Iceberg (STR-12).
+
+### Kết quả STR-09 (23/11/2026)
+
+| Kiểm tra | Kết quả |
+|---|---|
+| Unit tests (`tests/streaming`) | 31/31 pass (thêm 12 test Silver + DQ: chỉ message hợp lệ, không tin cờ Bronze, dedup, poll không đổi vẫn giữ, kiểu cột; DQ pass khi sạch, fail khi trùng / thiếu / thừa khóa) |
+| `tests/integration/str09_silver.sh` | 7/7: replay dedup + poll không đổi giữ + invalid loại → 3 dòng; chạy lại không đổi; mất checkpoint Silver, đọc lại toàn bộ Bronze → vẫn 3 dòng; thêm poll mới + replay → 4 dòng; DQ pass, và exit 1 khi chèn dòng trùng |
+| Dữ liệu thật: `gbfs-poller` → Kafka → service `spark-streaming` (Bronze + Silver), restart giữa chừng | 3 lần polling → `silver.gbfs_status` 7557 dòng = 3 × 2519, 7557 khóa khác nhau; `dq_checks --layer silver_status` 7/7 PASS |
+
+Ghi chú: khi mất checkpoint Silver và đọc lại Bronze, MERGE không thêm dòng nhưng Iceberg vẫn ghi một snapshot rỗng.
+Chưa kiểm tra: đọc Silver bằng Trino; xóa snapshot cũ của Bronze (maintenance) khi query Silver đang chạy.
