@@ -161,7 +161,9 @@ class Polls:
                     value = json.loads(message.value())
                     if parse_time(value["collected_at"]) < self.since:
                         continue
-                    key = value.get("poll_id") or value["collected_at"]
+                    # Message information cũ (trước khi có poll_id) chỉ nối
+                    # được qua collected_at.
+                    key = value.get("poll_id") or ("collected_at", value["collected_at"])
                     stations[key].add(value["station_id"])
                 self._attach(feed, stations)
         finally:
@@ -173,12 +175,12 @@ class Polls:
             for poll_id, info in self.polls[feed].items()
         }
         for key, ids in stations.items():
-            if feed == "station_status":
+            if isinstance(key, str):
                 poll_id = key
-            else:   # information không có poll_id: nối qua collected_at
-                poll_id = by_time.get(parse_time(key))
+            else:   # message không có poll_id: nối qua collected_at
+                poll_id = by_time.get(parse_time(key[1]))
                 if poll_id is None:
-                    self.unmapped_info[key] = len(ids)
+                    self.unmapped_info[key[1]] = len(ids)
                     continue
             self.polls[feed][poll_id]["kafka"] = len(ids)
 
