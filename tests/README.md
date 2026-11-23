@@ -97,7 +97,7 @@ thái nào khác.
 | `test_2` | SIGTERM khi GBFS treo quá timeout (cần ~93 s nếu retry đủ) | Dừng sau ~30 s, exit 0, không có dữ liệu ghi dở |
 | `test_3` | SIGTERM khi Kafka treo | Dừng sau ~29 s, exit 0, hai lần polling được giữ lại; `--replay` đưa về hoàn tất |
 | `test_4` | SIGKILL khi MinIO treo (đã gửi Kafka) | Exit 137, hai lần polling được giữ lại |
-| `test_5` | Tạo lại container (`up --force-recreate`) | Thư mục giữ lại vẫn còn (volume), không mất lần polling nào |
+| `test_5` | Tạo lại container (`up --force-recreate`) | Thư mục giữ lại vẫn còn (volume `gbfs-spool`), và `--replay` trong container mới đưa chúng về hoàn tất. Bỏ volume thì test này fail |
 
 Thời gian chạy khoảng 2,5 phút. Trước khi sửa, `test_2` (dừng sau ~92 s) và `test_5`
 (mất thư mục giữ lại) đều fail.

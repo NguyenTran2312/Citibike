@@ -368,6 +368,24 @@ class PollerShutdownTest(unittest.TestCase):
         print(f"  kept trước khi tạo lại: {kept_before}, LOST sau: {len(lost)}")
         self.assertEqual(lost, [], "Thư mục giữ lại để replay bị mất khi tạo lại container")
 
+        # Replay ngay trong container mới: bản giữ lại vẫn gửi bù được.
+        kept = [
+            (feed, poll_id) for feed in FEEDS for poll_id in after.polls[feed]
+            if after.state(feed, poll_id) == "kept"
+        ]
+        self.assertGreaterEqual(len(kept), kept_before)
+        subprocess.run(["docker", "start", container_id()], check=True, capture_output=True)
+        for feed, poll_id in kept:
+            compose("exec", "-T", POLLER, "python", "-m", "ingestion.gbfs.poller",
+                    "--replay", f"/app/data/gbfs/{feed}/{poll_id}")
+        compose("stop", POLLER)
+
+        replayed = Polls(datetime(2000, 1, 1, tzinfo=timezone.utc))
+        self.report("replay sau khi tạo lại container", replayed)
+        self.assertEqual(replayed.violations(), [])
+        for feed, poll_id in kept:
+            self.assertEqual(replayed.state(feed, poll_id), "complete")
+
 
 if __name__ == "__main__":
     unittest.main()
