@@ -54,7 +54,7 @@ Khi chạy bằng Docker Compose, image `citibike/python:local`
 | Trường | Kiểu |
 |---|---|
 | `poll_id` | string |
-| `last_updated` | integer |
+| `last_updated` | integer, epoch giây 0–4102444800 (tới năm 2100) |
 | `collected_at` | datetime có timezone |
 | `station_id` | string |
 | `num_bikes_available` | integer không âm |
@@ -62,7 +62,7 @@ Khi chạy bằng Docker Compose, image `citibike/python:local`
 | `is_installed` | boolean |
 | `is_renting` | boolean |
 | `is_returning` | boolean |
-| `last_reported` | integer |
+| `last_reported` | integer, epoch giây 0–4102444800 (tới năm 2100) |
 | `schema_version` | integer, cố định bằng 1 |
 | `vehicle_types_available` | array hoặc null |
 
@@ -78,7 +78,7 @@ Khóa logic của observation trạng thái là `(station_id, poll_id)`.
 | Trường | Kiểu |
 |---|---|
 | `poll_id` | string |
-| `last_updated` | integer |
+| `last_updated` | integer, epoch giây 0–4102444800 (tới năm 2100) |
 | `collected_at` | datetime có timezone |
 | `station_id` | string |
 | `name` | string |

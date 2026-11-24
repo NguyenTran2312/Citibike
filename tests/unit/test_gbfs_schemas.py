@@ -111,6 +111,15 @@ class TestGBFSSchemas(unittest.TestCase):
         # Việc validate không được sửa dictionary đầu vào.
         self.assertIn("future_source_field", row)
 
+    def test_epoch_in_milliseconds_or_microseconds_is_rejected(self):
+        for value in (1794787200000, 1794787200000000):
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    StationStatus.model_validate({**self.status, "last_reported": value})
+                with self.assertRaises(ValidationError):
+                    StationStatusMessage.model_validate(
+                        {**self.status, **self.metadata, "last_updated": value})
+
     def test_old_last_reported_is_preserved(self):
         row = {**self.status, "last_reported": 86400}
         result = StationStatus.model_validate(row)

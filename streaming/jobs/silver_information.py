@@ -27,7 +27,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from streaming.jobs.gbfs_history import BRONZE_TABLES, build_spark
-from streaming.jobs.silver import first_per_key, start_silver_query, valid_messages
+from streaming.jobs.silver import first_per_key, rebuild, start_silver_query, valid_messages
 
 SILVER_INFORMATION_TABLE = os.environ.get("SILVER_INFORMATION_TABLE",
                                           "lakehouse.silver.gbfs_station_information")
@@ -88,16 +88,22 @@ def silver_information_rows(bronze: DataFrame) -> DataFrame:
 
 
 def start_silver_information_query(spark: SparkSession, checkpoint: str | None = None,
-                                   available_now: bool = False):
+                                   available_now: bool = False,
+                                   from_timestamp_ms: int | None = None):
     return start_silver_query(spark, "information", SILVER_INFORMATION_TABLE,
                               SILVER_INFORMATION_DDL, silver_information_rows,
-                              checkpoint or SILVER_INFORMATION_CHECKPOINT, available_now)
+                              checkpoint or SILVER_INFORMATION_CHECKPOINT, available_now,
+                              from_timestamp_ms)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bronze -> silver.gbfs_station_information")
     parser.add_argument("--available-now", action="store_true",
                         help="process the Bronze rows not merged yet, then stop")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="MERGE all of Bronze (current snapshot) into Silver, then stream "
+                             "later Bronze commits with a NEW checkpoint (after expired "
+                             "snapshots or a lost checkpoint)")
     parser.add_argument("--checkpoint-dir",
                         help="checkpoint root (uses <dir>/silver_information); "
                              "default SILVER_INFORMATION_CHECKPOINT_LOCATION")
@@ -106,7 +112,14 @@ def main() -> int:
     spark = build_spark("gbfs-silver-information")
     checkpoint = (args.checkpoint_dir
                   and f"{args.checkpoint_dir.rstrip('/')}/silver_information")
-    query = start_silver_information_query(spark, checkpoint, args.available_now)
+    from_ms = None
+    if args.rebuild:
+        checkpoint = checkpoint or SILVER_INFORMATION_CHECKPOINT
+        if not checkpoint:
+            raise SystemExit("--rebuild needs a new checkpoint (--checkpoint-dir or "
+                             "SILVER_INFORMATION_CHECKPOINT_LOCATION)")
+        from_ms = rebuild(spark, "information", SILVER_INFORMATION_TABLE, SILVER_INFORMATION_DDL, silver_information_rows, checkpoint) + 1
+    query = start_silver_information_query(spark, checkpoint, args.available_now, from_ms)
     print(f"started silver: {BRONZE_TABLES['information']} -> {SILVER_INFORMATION_TABLE}",
           flush=True)
     query.awaitTermination()

@@ -2,7 +2,8 @@
 
     str12_helper.py stats <bronze_table> <silver_table>   -> STR12_RESULT {...}
     str12_helper.py batches <checkpoint_dir>               -> STR12_RESULT {"offsets": [...], "commits": [...]}
-    str12_helper.py rm <path>                              -> delete a file or directory
+    str12_helper.py rm <path>                              -> STR12_RESULT {"deleted": bool}
+    str12_helper.py expire <table>                         -> expire all but the current snapshot
     str12_helper.py drop <table> [<table> ...]             -> DROP TABLE ... PURGE
 """
 import json
@@ -61,7 +62,16 @@ def main() -> None:
               "commits": list_batches(spark, args[0], "commits")})
     elif action == "rm":
         path = spark._jvm.org.apache.hadoop.fs.Path(args[0])
-        path.getFileSystem(spark._jsc.hadoopConfiguration()).delete(path, True)
+        emit({"deleted": path.getFileSystem(spark._jsc.hadoopConfiguration()).delete(path, True)})
+    elif action == "expire":
+        catalog, name = args[0].split(".", 1)
+        # CALL takes literals only; the timestamp is read in the same session time zone.
+        cutoff = spark.sql("SELECT date_format(current_timestamp() + INTERVAL 1 MINUTE, "
+                           "'yyyy-MM-dd HH:mm:ss')").first()[0]
+        row = spark.sql(f"CALL {catalog}.system.expire_snapshots(table => '{name}', "
+                        f"older_than => TIMESTAMP '{cutoff}', retain_last => 1)").first()
+        emit({"deleted_manifest_lists": row["deleted_manifest_lists_count"],
+              "snapshots": snapshots(spark, args[0])})
     elif action == "drop":
         for table in args:
             spark.sql(f"DROP TABLE IF EXISTS {table} PURGE")

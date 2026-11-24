@@ -126,6 +126,21 @@ expect_dq "run 3 data-quality gate" 0
 bronze_then_silver run4
 expect_silver "run 4 (new poll + replay)" "abc/$P1 abc/poll-2 def/$P1 def/poll-3"
 
+# Run 5 (review finding): the poll-2 message again, with a collected_at one minute
+# later. Same (station_id, poll_id) -> still one row.
+head -n 1 "$FIXTURES/station_status.jsonl" \
+  | sed "s/$P1/poll-2/; s/2026-11-16T02:40:00Z/2026-11-16T02:41:00Z/" | produce
+bronze_then_silver run5
+expect_silver "run 5 (same key, collected_at one minute later)" "abc/$P1 abc/poll-2 def/$P1 def/poll-3"
+
+# Run 6 (review finding): Silver checkpoint lost again and Bronze replayed with a
+# non-UTC Spark session time zone -> no new rows.
+must rm-silver6.log /opt/project/tests/integration/str09_silver_check.py "$CKPT/silver_status" rm
+must run6-silver.log --conf spark.sql.session.timeZone=Asia/Ho_Chi_Minh \
+  /opt/project/streaming/jobs/silver_status.py --available-now --checkpoint-dir "$CKPT"
+expect_silver "run 6 (full replay, session time zone Asia/Ho_Chi_Minh)" "abc/$P1 abc/poll-2 def/$P1 def/poll-3"
+expect_dq "run 6 data-quality gate" 0
+
 # The gate must catch a broken Silver: inject a duplicate row.
 must inject.log /opt/project/tests/integration/str09_silver_check.py "$SILVER" inject-duplicate
 expect_dq "data-quality gate on an injected duplicate" 1

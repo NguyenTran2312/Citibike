@@ -32,6 +32,7 @@ Environment (names match docker-compose.yml):
   STREAM_TRIGGER_INTERVAL   default "5 minutes" (contract 2.3.3); use "30 seconds" to debug
   STARTING_OFFSETS          default earliest (first run only; then the checkpoint wins)
   MAX_OFFSETS_PER_TRIGGER   default 100000 per query and micro-batch (see below)
+  FAIL_ON_DATA_LOSS         default true: stop if Kafka no longer has needed offsets
   STATUS_CHECKPOINT_LOCATION / INFORMATION_CHECKPOINT_LOCATION
                             checkpoints of the Bronze queries (one per feed)
   BRONZE_STATUS_TABLE       default lakehouse.bronze.gbfs_status
@@ -42,6 +43,7 @@ from __future__ import annotations  # apache/spark:3.5.6 ships Python 3.8
 import argparse
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Callable, Dict, List, NamedTuple, Tuple
 
@@ -71,6 +73,10 @@ STARTING_OFFSETS = os.environ.get("STARTING_OFFSETS", "earliest")
 # fell ~7600 messages further behind every trigger. 100000 also drains a backlog
 # (e.g. after Spark was down) at ~8x the arrival rate.
 MAX_OFFSETS_PER_TRIGGER = int(os.environ.get("MAX_OFFSETS_PER_TRIGGER", "100000"))
+# Stop when offsets the checkpoint still needs are gone (Spark down longer than the
+# 7-day retention, topic recreated): history would silently get a hole otherwise.
+# See streaming/README.md "Kafka mất dữ liệu" for the recovery steps.
+FAIL_ON_DATA_LOSS = os.environ.get("FAIL_ON_DATA_LOSS", "true").lower()
 BRONZE_TABLES = {
     "status": os.environ.get("BRONZE_STATUS_TABLE", "lakehouse.bronze.gbfs_status"),
     "information": os.environ.get("BRONZE_INFORMATION_TABLE",
@@ -94,6 +100,9 @@ CORRUPT_COL = "_corrupt_record"
 KAFKA_META = ["kafka_topic", "kafka_partition", "kafka_offset", "kafka_timestamp", "kafka_key"]
 # ISO-8601 with an explicit timezone: ...Z or ...+07:00 / -0500
 TZ_SUFFIX = r"(Z|[+-][0-9]{2}:?[0-9]{2})$"
+# Largest epoch-seconds value accepted (2100-01-01T00:00:00Z). Bigger values are
+# milliseconds / microseconds and make timestamp_seconds() overflow in Silver.
+MAX_EPOCH_SECONDS = 4102444800
 
 Rule = Tuple[Column, str]  # (condition that means "broken", message)
 
@@ -109,6 +118,19 @@ def _non_empty(*fields: str) -> List[Rule]:
 
 def _non_negative(*fields: str) -> List[Rule]:
     return [(F.col(f) < 0, f"negative {f}") for f in fields]
+
+
+def _epoch_seconds(*fields: str) -> List[Rule]:
+    return [(F.col(f) > MAX_EPOCH_SECONDS,
+             f"{f} is not epoch seconds (> {MAX_EPOCH_SECONDS})") for f in fields]
+
+
+def _json_string(*fields: str) -> List[Rule]:
+    """from_json turns 123 or {} into "123" / "{}" for a STRING field, while the
+    producer (Pydantic) rejects them: check the token type in the raw message."""
+    raw = F.col("raw_value")
+    return [(F.col(f).isNotNull() & ~raw.rlike(rf'"{f}"\s*:\s*"'),
+             f"{f} must be a JSON string") for f in fields]
 
 
 def _iso_datetime_with_tz(field: str) -> List[Rule]:
@@ -130,8 +152,10 @@ def status_rules() -> List[Rule]:
                   "is_installed", "is_renting", "is_returning", "last_reported",
                   "last_updated", "collected_at")
         + _non_empty("poll_id", "station_id")
+        + _json_string("poll_id", "station_id", "collected_at")
         + _non_negative("num_bikes_available", "num_docks_available",
                         "last_reported", "last_updated")
+        + _epoch_seconds("last_reported", "last_updated")
         + _iso_datetime_with_tz("collected_at")
         + [(F.col("schema_version").isNotNull() & (F.col("schema_version") != 1),
             "schema_version must be 1"),
@@ -143,7 +167,10 @@ def information_rules() -> List[Rule]:
     return (
         _required("poll_id", "last_updated", "collected_at", "station_id", "name", "lat", "lon")
         + _non_empty("poll_id", "station_id", "name")
+        + _json_string("poll_id", "station_id", "name", "short_name", "region_id",
+                       "collected_at")
         + _non_negative("last_updated", "capacity")
+        + _epoch_seconds("last_updated")
         + _iso_datetime_with_tz("collected_at")
         + [((F.col("lat") < -90) | (F.col("lat") > 90), "lat out of range [-90, 90]"),
            ((F.col("lon") < -180) | (F.col("lon") > 180), "lon out of range [-180, 180]")]
@@ -154,6 +181,7 @@ def invalid_rules() -> List[Rule]:
     return (
         _required("source", "error_type", "error_message", "raw_payload", "detected_at")
         + _non_empty("source", "error_type", "error_message")
+        + _json_string("source", "error_type", "error_message", "detected_at")
         + _iso_datetime_with_tz("detected_at")
     )
 
@@ -193,7 +221,7 @@ def read_kafka(spark: SparkSession, topic: str, feed: str) -> DataFrame:
         .option("groupIdPrefix", f"{KAFKA_GROUP_ID}-{feed}")
         .option("startingOffsets", STARTING_OFFSETS)
         .option("maxOffsetsPerTrigger", MAX_OFFSETS_PER_TRIGGER)
-        .option("failOnDataLoss", "false")
+        .option("failOnDataLoss", FAIL_ON_DATA_LOSS)
         .load()
     )
 
@@ -337,18 +365,69 @@ def ensure_bronze_table(spark: SparkSession, feed: str) -> str:
     return table
 
 
+# Snapshot property that marks which micro-batch an append came from.
+BATCH_MARKER = "gbfs.source-batch"
+
+
+def batch_committed(spark: SparkSession, table: str, marker: str) -> bool:
+    """True when a snapshot in the current history carries `marker`."""
+    iceberg = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(
+        spark._jsparkSession, table)
+    snapshot = iceberg.currentSnapshot()
+    while snapshot is not None:
+        if snapshot.summary().get(BATCH_MARKER) == marker:
+            return True
+        parent = snapshot.parentId()
+        snapshot = iceberg.snapshot(parent) if parent is not None else None
+    return False
+
+
 def start_bronze_query(spark: SparkSession, feed: str, checkpoint: str, available_now: bool):
+    """Kafka -> Bronze with an idempotent append per micro-batch.
+
+    Not the Iceberg streaming sink: when a committed micro-batch is replayed in a
+    new Spark application (crash after the Iceberg commit, before the checkpoint
+    commit), that sink writes data files with the *same names* as the committed
+    ones (<partition>-<task>-<query id>-<epoch>-...), overwrites them on S3 and then
+    skips the commit, so the committed snapshot points at files whose size changed
+    and every read fails (tests/integration/test_spark_recovery.py, scenario 2).
+
+    Here each micro-batch is a normal Iceberg append (fresh file names) tagged with
+    the snapshot property gbfs.source-batch = <query id>:<batch id>. A replayed batch
+    whose marker is already in the table history is skipped. The query id is kept in
+    the checkpoint, so a new checkpoint never matches an old marker.
+    """
     table = ensure_bronze_table(spark, feed)
     rows = bronze_rows(validate(parse_value(read_kafka(spark, FEEDS[feed].topic, feed),
                                             FEEDS[feed].schema), feed))
-    writer = (rows.writeStream.format("iceberg").outputMode("append")
-              .queryName(f"gbfs_{feed}_bronze")
+    started = threading.Event()
+    query_id: Dict[str, str] = {}
+
+    def append_batch(batch: DataFrame, batch_id: int) -> None:
+        started.wait()
+        marker = f"{query_id['id']}:{batch_id}"
+        session = batch.sparkSession
+        if batch_committed(session, table, marker):
+            print(f"[bronze] {table}: batch {batch_id} already committed, skipped", flush=True)
+            return
+        batch = batch.persist()   # read Kafka once; ingested_at stays the same
+        try:
+            if not batch.isEmpty():
+                batch.writeTo(table).option(f"snapshot-property.{BATCH_MARKER}", marker).append()
+        finally:
+            batch.unpersist()
+
+    writer = (rows.writeStream.queryName(f"gbfs_{feed}_bronze")
+              .foreachBatch(append_batch)
               .option("checkpointLocation", checkpoint))
     if available_now:
         writer = writer.trigger(availableNow=True)
     else:
         writer = writer.trigger(processingTime=TRIGGER_INTERVAL)
-    return writer.toTable(table)
+    query = writer.start()
+    query_id["id"] = query.id
+    started.set()
+    return query
 
 
 # --- Fixture check -------------------------------------------------------------

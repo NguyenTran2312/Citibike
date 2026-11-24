@@ -24,6 +24,7 @@
   "description": "Message station_status chuẩn hóa.",
   "properties": {
     "last_updated": {
+      "maximum": 4102444800,
       "minimum": 0,
       "title": "Last Updated",
       "type": "integer"
@@ -72,6 +73,7 @@
       "type": "boolean"
     },
     "last_reported": {
+      "maximum": 4102444800,
       "minimum": 0,
       "title": "Last Reported",
       "type": "integer"

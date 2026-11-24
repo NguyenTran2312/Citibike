@@ -22,7 +22,9 @@ Schema Spark khớp tên field với JSON Schema của producer (`ingestion/gbfs
 |---|---|
 | `PARSE_ERROR` | Message rỗng hoặc không phải JSON |
 | `SCHEMA_ERROR` | JSON hợp lệ nhưng không phải object, hoặc field sai kiểu (`"five"` cho số, `"true"` cho boolean) |
-| `VALIDATION_ERROR` | Parse được nhưng vi phạm contract: thiếu field bắt buộc, chuỗi rỗng, số âm, `schema_version != 1`, datetime thiếu timezone, `lat/lon` ngoài phạm vi… (liệt kê tất cả lỗi, nối bằng `; `) |
+| `VALIDATION_ERROR` | Parse được nhưng vi phạm contract: thiếu field bắt buộc, chuỗi rỗng, số âm, `schema_version != 1`, datetime thiếu timezone, `lat/lon` ngoài phạm vi, trường chuỗi không phải chuỗi JSON (`"station_id": 123`, `"poll_id": {}`), epoch không phải giây (`last_reported` / `last_updated` > 4102444800, tức sau năm 2100)… (liệt kê tất cả lỗi, nối bằng `; `) |
+
+`from_json` của Spark tự đổi số hoặc object thành chuỗi khi field có kiểu `STRING` (`123` → `"123"`), trong khi producer (Pydantic) từ chối; luật "phải là chuỗi JSON" kiểm tra kiểu token trong `raw_value` để Spark khớp với producer. Giới hạn epoch có ở cả producer (`EpochSeconds`) và Spark: giá trị mili/micro giây làm tràn số khi Silver đổi sang `TIMESTAMP`.
 
 Message sai được đưa về đúng dạng `gbfs.invalid` (`source, error_type, error_message, raw_payload, detected_at`) bằng `invalid_rows()`.
 
@@ -39,7 +41,8 @@ Message sai được đưa về đúng dạng `gbfs.invalid` (`source, error_typ
 - `poll_id`, `station_id`, `collected_at` (timestamp) được tách ra từ message cho việc lọc, đọc incremental và dedup ở Silver; null khi message không parse được.
 - `kafka_key` là key producer gửi (`station_id`); `ingested_at` là thời điểm micro-batch được xử lý.
 - Partition theo `days(ingested_at)`. Iceberg format v2.
-- Exactly-once: mỗi micro-batch là một commit Iceberg, offset Kafka nằm trong checkpoint của query. Restart không đọc lại batch đã commit.
+- **Exactly-once:** offset Kafka nằm trong checkpoint của query; mỗi micro-batch là **một lần append Iceberg** (`foreachBatch`) gắn thuộc tính snapshot `gbfs.source-batch = <query id>:<batch id>`. Batch được chạy lại (crash sau commit Iceberg, trước khi checkpoint ghi `commits/<n>`) mà đã có snapshot mang đúng dấu này thì bị bỏ qua. Query id nằm trong checkpoint, nên checkpoint mới không bao giờ trùng dấu cũ.
+- **Vì sao không dùng Iceberg streaming sink (`writeStream.format("iceberg")`):** khi một batch đã commit được chạy lại trong một ứng dụng Spark mới, sink đó ghi file dữ liệu **trùng tên** với file đã commit (`<partition>-<task>-<query id>-<epoch>-…`), ghi đè lên MinIO rồi mới bỏ qua commit; snapshot đã commit trỏ tới file có kích thước khác và mọi lần đọc Bronze lỗi `EOFException`. Lỗi này lộ ra ở kịch bản 2 của `tests/integration/test_spark_recovery.py` (review STR-12). Append kiểu batch luôn tạo tên file mới.
 - Mỗi feed một query, một checkpoint riêng. **Không** dùng chung checkpoint giữa Bronze và console.
 
 ## Silver status (STR-09)
@@ -50,17 +53,23 @@ Message sai được đưa về đúng dạng `gbfs.invalid` (`source, error_typ
 - **Nguồn:** đọc `bronze.gbfs_status` incremental (Iceberg streaming source), checkpoint `SILVER_STATUS_CHECKPOINT_LOCATION` = `s3a://checkpoints/silver-status/`. Checkpoint này **phải nằm trên S3/MinIO**: Iceberg source ghi offset bằng S3FileIO của bảng.
 - **Validation:** parse + validate lại `raw_value` bằng cùng schema và luật của STR-07 (không tin cờ `dq_is_valid` đã lưu ở Bronze), nên đổi luật thì dựng lại Silver từ Bronze được. Message sai chỉ nằm ở Bronze.
 - **Dedup:** message phát lại cùng `(station_id, poll_id)` (producer retry, `--replay`) chỉ còn một dòng; giữ Kafka offset nhỏ nhất.
-- **Idempotent:** `MERGE ... WHEN NOT MATCHED THEN INSERT *` theo `(station_id, poll_id, collected_at)`. Micro-batch chạy lại, hoặc mất checkpoint Silver rồi đọc lại toàn bộ Bronze, không thêm dòng trùng. Khoảng `collected_at` của batch được đưa vào điều kiện MERGE để Iceberg chỉ quét các partition liên quan.
+- **Idempotent:** `MERGE ... ON (station_id, poll_id) WHEN NOT MATCHED THEN INSERT *`. Micro-batch chạy lại, hoặc mất checkpoint Silver rồi đọc lại toàn bộ Bronze, không thêm dòng trùng; cùng khóa đến sau với `collected_at` khác thì vẫn giữ dòng đầu tiên.
+- **Prune partition:** điều kiện MERGE có thêm `t.collected_at` trong khoảng `collected_at` của batch ±1 ngày, tính bằng micro giây epoch (`timestamp_micros`), nên không phụ thuộc timezone của driver hay của session Spark. Mọi message của một lần polling mang cùng `collected_at`; chỉ khi cùng `(station_id, poll_id)` quay lại với `collected_at` lệch hơn 1 ngày (dữ liệu hỏng) mới có dòng thứ hai, và check `silver_status_grain_unique` báo lỗi.
 - `last_updated`, `last_reported` (epoch giây) và `collected_at` được đổi sang `TIMESTAMP` UTC, giữ riêng từng cột. Cột lineage: `kafka_partition`, `kafka_offset`, `bronze_ingested_at`, `silver_processed_at`.
 
 ```bash
-# Chạy bù Silver từ Bronze rồi dừng (thủ công / Airflow / test)
-docker compose exec spark-master /opt/spark/bin/spark-submit \
+# Chạy bù Silver từ Bronze rồi dừng (thủ công / Airflow).
+# Mỗi checkpoint chỉ được MỘT writer: dừng service trước, rồi truyền đúng checkpoint của nó
+# (spark-master không có sẵn biến SILVER_*_CHECKPOINT_LOCATION).
+docker compose --profile pipeline stop spark-streaming
+docker compose exec -e SILVER_STATUS_CHECKPOINT_LOCATION=s3a://checkpoints/silver-status/ \
+  spark-master /opt/spark/bin/spark-submit \
   /opt/project/streaming/jobs/silver_status.py --available-now
 
-# Data-quality gate (exit 1 khi có check error thất bại)
+# Data-quality gate (exit 1 khi có check error thất bại); chạy khi Bronze đứng yên
 docker compose exec spark-master /opt/spark/bin/spark-submit \
   /opt/project/streaming/jobs/dq_checks.py --layer silver_status
+docker compose --profile pipeline start spark-streaming
 ```
 
 | Check `silver_status` | Mức | Ý nghĩa |
@@ -73,7 +82,33 @@ docker compose exec spark-master /opt/spark/bin/spark-submit \
 | `silver_status_poll_completeness` | warn | Lần polling có ít hơn 90% số trạm của lần lớn nhất |
 | `silver_status_last_reported_not_after_collected` | warn | `last_reported` sau `collected_at` |
 
-Hai check đối soát với Bronze chỉ có nghĩa khi Silver đã bắt kịp Bronze (ví dụ ngay sau `silver_status.py --available-now`); khi query đang chạy, Silver trễ Bronze tối đa một trigger. Layer `bronze_status` có thêm check không trùng offset.
+Hai check đối soát với Bronze so Silver với các khóa Bronze **hợp lệ theo luật hiện tại**: `dq_checks.py` validate lại `raw_value` bằng cùng code Silver dùng, không tin cờ `dq_is_valid` đã lưu lúc ingest. Chúng chỉ đúng khi Bronze đứng yên và Silver đã bắt kịp (như lệnh trên: dừng service, `--available-now`, rồi DQ); nếu Bronze commit thêm sau lần chạy cuối của Silver, các khóa đó bị báo là thiếu. Layer `bronze_status` có thêm check không trùng offset.
+
+### Giữ snapshot và dựng lại Silver
+
+Query Silver đọc Bronze bằng Iceberg streaming source: nó cần **mọi snapshot Bronze sau snapshot ghi trong checkpoint**. Compaction (`rewrite_data_files`, snapshot `replace`) không ảnh hưởng, source bỏ qua snapshot đó. Nhưng `expire_snapshots` xóa snapshot mà checkpoint còn trỏ tới thì query Silver dừng với lỗi, và tạo checkpoint mới cũng **không** lấy lại được dữ liệu đã bỏ lỡ.
+
+- **Quy tắc maintenance:** chỉ expire snapshot Bronze cũ hơn độ trễ tối đa có thể của Silver, ví dụ `older_than` = 7 ngày trước (bằng retention Kafka) và `retain_last` đủ lớn. Bình thường Silver trễ Bronze dưới một trigger.
+- **Khi đã lỡ expire (hoặc mất / hỏng checkpoint Silver):** dừng service, chạy `--rebuild` với **checkpoint mới**:
+
+```bash
+docker compose --profile pipeline stop spark-streaming
+docker compose exec spark-master /opt/spark/bin/spark-submit \
+  /opt/project/streaming/jobs/silver_status.py --rebuild --available-now \
+  --checkpoint-dir s3a://checkpoints/silver-status-rebuild-$(date +%Y%m%d)
+# rồi đổi SILVER_STATUS_CHECKPOINT_LOCATION của spark-streaming sang
+# s3a://checkpoints/silver-status-rebuild-<ngày>/silver_status và khởi động lại service
+```
+
+`--rebuild` MERGE toàn bộ Bronze ở snapshot hiện tại vào Silver (chỉ insert khóa chưa có, nên không trùng), rồi khởi động query streaming với checkpoint mới, đọc tiếp từ snapshot Bronze commit sau đó (`stream-from-timestamp`). `--rebuild` từ chối checkpoint đã tồn tại. `silver_information.py` có cùng tùy chọn.
+
+### Kafka mất dữ liệu (`FAIL_ON_DATA_LOSS`)
+
+Mặc định `FAIL_ON_DATA_LOSS=true`: nếu offset mà checkpoint cần đã bị Kafka xóa (Spark dừng lâu hơn retention 7 ngày, topic bị tạo lại), query Bronze dừng với lỗi thay vì chạy tiếp với lịch sử bị hổng. Khi gặp lỗi này:
+
+1. Xác định khoảng bị mất (log lỗi có offset; `kafka-get-offsets.sh --time -2` cho offset sớm nhất còn lại).
+2. Nếu cần lịch sử đầy đủ: bù từ raw trên MinIO (`s3://raw/gbfs/...`, mỗi lần polling một file).
+3. Nếu chấp nhận khoảng trống: chạy service một lần với `FAIL_ON_DATA_LOSS=false` để Spark nhảy qua, ghi lại khoảng trống trong runbook, rồi đặt lại `true`.
 
 ## Silver station information (STR-10)
 
@@ -150,7 +185,7 @@ Hai query "history" của contract mục 2.3.4 là hai query Bronze; hai query S
 
 - **Trigger:** `STREAM_TRIGGER_INTERVAL`, mặc định **5 phút** (contract 2.3.3). Spark căn trigger theo mốc thời gian (…:00, …:05, …:10). Silver đọc phần Bronze đã commit ở trigger trước, nên Silver trễ Bronze 5–10 phút.
 - **Kiểm tra trước khi chạy:** job in kế hoạch (`[plan] <query>: checkpoint=… trigger=… maxOffsetsPerTrigger=…`) và **dừng trước khi start bất kỳ query nào** nếu một query thiếu checkpoint hoặc hai query dùng chung / lồng checkpoint nhau.
-- **`MAX_OFFSETS_PER_TRIGGER` = 100000** (mỗi query Kafka, mỗi micro-batch). Trigger theo thời gian không chạy dồn để đuổi kịp, nên giới hạn này phải lớn hơn số message đến trong một trigger: status khoảng 2519 × 5 = 12 595 message mỗi 5 phút. Với giới hạn cũ 5000, query status tụt thêm khoảng 7 600 message mỗi trigger (khoảng 2,2 triệu mỗi ngày). 100000 cũng đủ để đuổi kịp backlog (ví dụ sau khi Spark dừng) nhanh gấp khoảng 8 lần tốc độ đến.
+- **`MAX_OFFSETS_PER_TRIGGER` = 100000** (mỗi query Kafka, mỗi micro-batch). Với trigger theo thời gian, batch xong sớm thì batch sau chờ tới mốc trigger kế tiếp (chỉ khi một batch chạy lâu hơn chu kỳ, batch sau mới bắt đầu ngay), nên một batch phải đọc hết số message đến trong một trigger: status khoảng 2519 × 5 = 12 595 message mỗi 5 phút. Với giới hạn cũ 5000, query status tụt thêm khoảng 7 600 message mỗi trigger (khoảng 2,2 triệu mỗi ngày). Về lý thuyết 100000 cho phép đọc nhanh hơn tốc độ đến khoảng 8 lần khi đuổi backlog; con số này **chưa được benchmark** với tài nguyên đã cấu hình.
 - **Kafka group:** mỗi query dùng group-id prefix `<KAFKA_GROUP_ID>-<feed>`. Spark tự gán partition và giữ offset trong checkpoint, không commit lên Kafka, nên các group này không xuất hiện trong `kafka-consumer-groups --list`; độ trễ đọc theo dõi bằng log tiến độ.
 - **Log tiến độ:** mỗi micro-batch một dòng `[progress] <query> batch=<n> at=<thời điểm> input_rows=<n> duration_ms=<n>`.
 - **Restart:** `restart: unless-stopped`. Offset và tiến độ nằm trong checkpoint nên khởi động lại thì đọc tiếp, không trùng (xem STR-08, STR-09).
@@ -178,7 +213,7 @@ bash tests/integration/str09_silver.sh
 bash tests/integration/str10_silver_information.sh
 
 # STR-12: crash/restart Spark, replay, Iceberg không ghi trùng (Python trên host cần
-# confluent-kafka; khoảng 13 phút; topic, bảng, checkpoint riêng, tự xoá)
+# confluent-kafka; COMPOSE_PROJECT_NAME phải kết thúc bằng -itest; khoảng 20 phút)
 python -m unittest tests.integration.test_spark_recovery -v
 ```
 
@@ -239,22 +274,25 @@ Chưa kiểm tra: đọc Silver bằng Trino; xóa snapshot cũ của Bronze (ma
 
 ## Chịu lỗi Spark → Iceberg (STR-12)
 
-`tests/integration/test_spark_recovery.py` chạy các kịch bản của contract mục 2.4 bằng lỗi thật trên stack thật, cho cả Bronze (Kafka → Iceberg append) và Silver (Bronze → Iceberg MERGE). Sau mỗi kịch bản kiểm tra: Bronze theo từng partition bằng end offset Kafka, không có `(topic, partition, offset)` trùng, Silver có đúng số khóa đã gửi.
+`tests/integration/test_spark_recovery.py` chạy các kịch bản của contract mục 2.4 bằng lỗi thật trên stack thật, cho cả Bronze (Kafka → Iceberg append) và Silver (Bronze → Iceberg MERGE). Sau mỗi kịch bản kiểm tra: Bronze theo từng partition bằng end offset Kafka, không có `(topic, partition, offset)` trùng, Silver có đúng số khóa đã gửi. Test chỉ chạy khi `COMPOSE_PROJECT_NAME` kết thúc bằng `-itest`; topic, bảng, checkpoint có hậu tố theo lượt chạy; chỉ kill driver mang checkpoint của lượt đó; log đầy đủ từng bước được giữ trong thư mục in ra lúc bắt đầu.
 
-| Kịch bản (contract 2.4) | Cách gây lỗi | Kết quả (24/11/2026) |
+| Kịch bản (contract 2.4) | Cách gây lỗi | Kết quả (24/11/2026, 6/6 pass, khoảng 20 phút) |
 |---|---|---|
 | Chạy bình thường 100 message | — | Bronze 100 dòng (30 / 40 / 30 = end offset), Silver 100 |
-| Crash **sau Iceberg commit, trước checkpoint commit** | Xóa `commits/<n>` của batch cuối (đúng trạng thái crash đó để lại), chạy lại | Spark chạy lại batch `n`; Bronze vẫn 200 dòng và **không thêm snapshot** (Iceberg nhận ra epoch đã commit và bỏ qua); Silver vẫn 200 (MERGE chỉ insert) |
-| Crash **trước khi ghi Iceberg** | SIGKILL driver sau 1 batch, rồi sau 4 batch, trong lượt 20 000 message (`MAX_OFFSETS_PER_TRIGGER=2000`); SIGKILL driver Silver giữa MERGE | Exit 137. Checkpoint có `offsets/3` (rồi `offsets/7`) mà chưa có `commits/`: batch đã lên kế hoạch nhưng chưa ghi; Bronze dừng ở 2 200 rồi 10 200 dòng (chỉ các batch đã commit), 0 trùng. Chạy lại: Bronze 20 200 = end offset từng partition, Silver 20 200 |
-| Crash **sau khi checkpoint hoàn tất** | Chạy lại khi không có dữ liệu mới | Không batch mới, không snapshot mới, danh sách `offsets/` `commits/` không đổi |
-| **MinIO tạm mất** | `docker pause minio` trong lúc job chạy | Job lỗi sau khoảng 190 giây (`RESTException`, `SocketTimeoutException` khi Iceberg REST catalog đọc metadata), exit 1. Bật lại MinIO và chạy lại: Bronze 21 200 = end offset, Silver 21 200, 0 trùng |
+| Crash **sau Iceberg commit, trước checkpoint commit** | Xóa `commits/<n>` của batch cuối (test xác nhận file đã mất và batch `n` thành "chưa commit"), chạy lại | Batch `n` được chạy lại và nhận ra là đã commit: Bronze vẫn 200 dòng, **không thêm snapshot**, đọc được bình thường; Silver vẫn 200 |
+| Crash **trước khi ghi Iceberg** | SIGKILL driver Bronze sau 1 batch, rồi sau 4 batch (20 000 message, `MAX_OFFSETS_PER_TRIGGER=2000`); SIGKILL driver Silver ngay khi nó in `[silver] merge` | Exit 137. Checkpoint có batch đã lên kế hoạch mà chưa commit (`[3]`, `[7]`, Silver `[2]`); Bronze chỉ giữ các batch đã commit (2 200 rồi 10 200 dòng), 0 trùng. Chạy lại: 20 200 = end offset từng partition, Silver 20 200 |
+| Crash **sau khi checkpoint hoàn tất** | Chạy lại khi không có dữ liệu mới | Không batch mới, không snapshot mới, `offsets/` và `commits/` không đổi |
+| **MinIO mất giữa lượt chạy** | `docker pause minio` ngay sau batch đầu tiên của lượt 10 000 message | Job **không tự dừng trong 300 giây** (treo trong retry S3 / REST catalog), test phải kill. Bronze dừng ở 22 200 / 30 200 (các batch trước khi mất MinIO đã commit). Bật lại MinIO và chạy lại: 30 200 = end offset, Silver 30 200, 0 trùng |
+| **Snapshot Bronze bị expire** (ngoài contract, theo review) | `expire_snapshots` giữ lại 1 snapshot khi Silver còn chưa đọc phần mới | Silver với checkpoint cũ dừng (exit 1). `silver_status.py --rebuild` với checkpoint mới: Silver 30 600 = toàn bộ khóa; checkpoint mới đọc tiếp lần append sau (30 700) |
 
 | Tiêu chí | Kết luận |
 |---|---|
-| Fault tolerance | Phục hồi sau SIGKILL và sau khi MinIO mất, không cần thao tác tay ngoài việc chạy lại (service: `restart: unless-stopped`) |
-| Offset recovery | Đọc tiếp đúng vị trí: số dòng Bronze khớp end offset từng partition sau mọi lần restart |
+| Fault tolerance | Phục hồi sau SIGKILL và sau khi MinIO trở lại bằng cách chạy lại (service: `restart: unless-stopped`); mất snapshot Bronze thì phục hồi bằng `--rebuild` |
+| Offset recovery | Số dòng Bronze khớp end offset từng partition sau mọi lần restart |
 | Replay | Batch đã lên kế hoạch mà chưa commit được xử lý lại với đúng offset trong `offsets/<n>` |
-| Idempotency | Bronze: Iceberg bỏ qua epoch đã commit. Silver: MERGE chỉ insert theo `(station_id, poll_id)` |
+| Idempotency | Bronze: dấu `gbfs.source-batch` trên snapshot, batch đã commit bị bỏ qua và không ghi file nào. Silver: MERGE chỉ insert theo `(station_id, poll_id)` |
 | Data integrity | Không mất, không nhân đôi observation trong mọi kịch bản |
 
-Khi MinIO mất, service `spark-streaming` thoát với lỗi sau vài phút và được Docker khởi động lại liên tục (`unless-stopped`) cho tới khi MinIO trở lại; checkpoint bảo đảm đọc tiếp đúng chỗ.
+**Lỗi kịch bản 2 phát hiện:** với Iceberg streaming sink (bản trước), batch đã commit được chạy lại trong một ứng dụng Spark mới ghi file trùng tên và ghi đè file đã commit (kích thước file trên MinIO đổi, ví dụ 6449 → 6458 byte), làm Bronze không đọc được nữa (`EOFException`), kéo theo Silver lỗi. Lần chạy 5/5 trước đó pass chỉ vì file ghi lại tình cờ cùng kích thước. Bản này dùng `foreachBatch` + dấu snapshot (mục Bronze ở trên).
+
+**Khi MinIO mất giữa chừng:** service `spark-streaming` có thể treo trong retry thay vì thoát (lần thử pause MinIO *trước* khi khởi động thì job lỗi sau khoảng 190 giây). Dữ liệu không mất; khi MinIO trở lại, query đi tiếp hoặc cần `docker compose restart spark-streaming`.

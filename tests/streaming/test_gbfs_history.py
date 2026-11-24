@@ -213,6 +213,36 @@ class ParseValidateTest(unittest.TestCase):
         row = self._one(_valid_status(station_id=None, num_docks_available=-3))
         self.assertEqual(row.dq_error_message, "missing station_id; negative num_docks_available")
 
+    def test_wrong_typed_identifiers_are_rejected(self):
+        # from_json would turn 123 into "123" and {} into "{}" for a STRING field.
+        cases = [
+            (_valid_status(station_id=123), "status", "station_id must be a JSON string"),
+            (_valid_status(poll_id={}), "status", "poll_id must be a JSON string"),
+            (_valid_status(collected_at=1794796740), "status", "collected_at must be a JSON string"),
+            (_valid_information(name=5), "information", "name must be a JSON string"),
+            (_valid_information(region_id=71), "information", "region_id must be a JSON string"),
+        ]
+        for msg, feed, text in cases:
+            with self.subTest(msg=msg):
+                schema = STATION_STATUS_SCHEMA if feed == "status" else STATION_INFORMATION_SCHEMA
+                row = self._one(msg, feed, schema)
+                self.assertFalse(row.dq_is_valid)
+                self.assertIn(text, row.dq_error_message)
+
+    def test_strings_with_spaces_around_the_colon_are_accepted(self):
+        line = json.dumps(_valid_status()).replace('"station_id": "abc"', '"station_id" :  "abc"')
+        self.assertTrue(self._one(line).dq_is_valid)
+
+    def test_epoch_in_microseconds_is_rejected(self):
+        for field in ("last_reported", "last_updated"):
+            with self.subTest(field=field):
+                row = self._one(_valid_status(**{field: 1794787200000000}))
+                self.assertFalse(row.dq_is_valid)
+                self.assertIn(f"{field} is not epoch seconds", row.dq_error_message)
+        row = self._one(_valid_information(last_updated=1794787200000), "information",
+                        STATION_INFORMATION_SCHEMA)
+        self.assertIn("last_updated is not epoch seconds", row.dq_error_message)
+
     def test_information_invalid_cases(self):
         cases = [
             (_valid_information(name=None), "missing name"),

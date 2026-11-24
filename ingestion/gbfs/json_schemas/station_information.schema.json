@@ -46,6 +46,7 @@
   "description": "Message station_information: có poll_id, không có schema_version.",
   "properties": {
     "last_updated": {
+      "maximum": 4102444800,
       "minimum": 0,
       "title": "Last Updated",
       "type": "integer"

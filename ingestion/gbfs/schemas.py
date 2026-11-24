@@ -11,6 +11,9 @@ from pydantic import (
 
 
 NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+# Epoch giây, từ 1970 tới 2100-01-01T00:00:00Z. Giá trị lớn hơn là mili/micro giây
+# (sai đơn vị) và làm tràn số khi Spark đổi sang timestamp.
+EpochSeconds = Annotated[int, Field(strict=True, ge=0, le=4102444800)]
 NonEmptyString = Annotated[str, Field(min_length=1)]
 
 
@@ -34,7 +37,7 @@ class StationStatus(SourceModel):
     is_renting: StrictBool
     is_returning: StrictBool
 
-    last_reported: NonNegativeInt
+    last_reported: EpochSeconds
     vehicle_types_available: list[VehicleTypeAvailable] | None = None
 
     @field_validator(
@@ -79,7 +82,7 @@ class StationInformation(SourceModel):
 
 
 class FeedMetadata(BaseModel):
-    last_updated: NonNegativeInt
+    last_updated: EpochSeconds
     collected_at: AwareDatetime
 
 

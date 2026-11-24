@@ -43,7 +43,7 @@ bash tests/integration/str07_checkpoint_restart.sh
 bash tests/integration/str08_bronze.sh   # Bronze: rows == Kafka end offset mỗi partition, restart không trùng
 bash tests/integration/str09_silver.sh   # Silver: dedup, chạy lại / mất checkpoint không trùng, DQ gate bắt lỗi
 bash tests/integration/str10_silver_information.sh   # Silver information: đủ trường, snapshot, như trên
-python -m unittest tests.integration.test_spark_recovery -v   # STR-12: crash/restart Spark (cần confluent-kafka trên host, ~13 phút)
+python -m unittest tests.integration.test_spark_recovery -v   # STR-12: crash/restart Spark (COMPOSE_PROJECT_NAME *-itest, confluent-kafka trên host, ~20 phút)
 ```
 
 ### Latest State Consumer với Kafka và PostgreSQL thật (STR-05/06)

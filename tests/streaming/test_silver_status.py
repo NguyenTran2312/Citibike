@@ -142,6 +142,18 @@ class SilverStatusTest(unittest.TestCase):
         bronze = self.bronze([status(), status(poll_id="p2")])
         self.assertFalse(self.run_dq(bronze, silver_status_rows(bronze).filter("poll_id = 'p2'")))
 
+    def test_dq_reconciles_with_current_rules_not_stored_bronze_flags(self):
+        # Bronze flagged the message invalid when it was ingested; today's rules
+        # (the ones Silver applies) accept it, so it is a valid key for the DQ too.
+        bronze = self.bronze([status()]).withColumn("dq_is_valid", F.lit(False))
+        silver = silver_status_rows(bronze)
+        self.assertEqual(silver.count(), 1)
+        self.assertTrue(self.run_dq(bronze, silver))
+
+    def test_epoch_overflow_stays_out_of_silver(self):
+        rows = self.silver([status(last_reported=1794787200000000), status(poll_id="p2")])
+        self.assertEqual([r.poll_id for r in rows.collect()], ["p2"])
+
     def test_dq_fails_on_rows_bronze_did_not_accept(self):
         bronze = self.bronze([status()])
         extra = silver_status_rows(self.bronze([status(poll_id="never-in-bronze")]))

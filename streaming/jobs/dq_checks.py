@@ -7,9 +7,12 @@ fails, so an orchestrator stops the steps after it.
     spark-submit /opt/project/streaming/jobs/dq_checks.py --layer silver_status
     spark-submit /opt/project/streaming/jobs/dq_checks.py --layer silver_information
 
-Run reconciliation checks after Silver has caught up with Bronze (for example
-right after silver_*.py --available-now); while the streaming queries are
-running, Silver lags Bronze by up to one trigger.
+The Silver reconciliation checks compare Silver with the Bronze keys that pass
+validation *today* (raw_value re-validated with the same code Silver uses, not the
+dq_is_valid flag stored at ingest time). Run them on a quiet Bronze: stop the
+spark-streaming service (or wait for its Silver queries to catch up) and run
+silver_*.py --available-now first; otherwise rows Bronze committed after Silver's
+last batch show up as "missing".
 """
 from __future__ import annotations
 
@@ -50,9 +53,13 @@ def _bronze_checks(prefix: str, b: str) -> List[Check]:
     ]
 
 
+VALID_KEYS_VIEW = "dq_valid_bronze_keys"
+
+
 def _silver_key_checks(prefix: str, b: str, s: str) -> List[Check]:
-    """Grain and reconciliation with Bronze, shared by both Silver tables."""
-    valid_keys = f"(SELECT DISTINCT station_id, poll_id FROM {b} WHERE dq_is_valid)"
+    """Grain and reconciliation with Bronze, shared by both Silver tables.
+    VALID_KEYS_VIEW is created by run() from the Bronze table `b`."""
+    valid_keys = VALID_KEYS_VIEW
     return [
         (f"{prefix}_grain_unique", "error", f"""
             SELECT count(*) FROM (
@@ -110,7 +117,17 @@ def checks(layer: str, bronze: str, silver: str) -> List[Check]:
     raise ValueError(f"unknown layer {layer}")
 
 
+def create_valid_keys_view(spark: SparkSession, layer: str, bronze: str) -> None:
+    """Bronze keys that pass validation now: the same code path Silver uses."""
+    from streaming.jobs.silver import valid_messages
+    feed = layer.split("_", 1)[1]
+    (valid_messages(spark.table(bronze), feed).select("station_id", "poll_id").distinct()
+     .createOrReplaceTempView(VALID_KEYS_VIEW))
+
+
 def run(spark: SparkSession, layer: str, bronze: str, silver: str) -> bool:
+    if layer.startswith("silver_"):
+        create_valid_keys_view(spark, layer, bronze)
     ok = True
     for name, severity, sql in checks(layer, bronze, silver):
         bad = spark.sql(sql).collect()[0][0]

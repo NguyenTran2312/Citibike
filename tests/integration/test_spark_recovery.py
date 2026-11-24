@@ -6,19 +6,26 @@ and Silver (Bronze -> Iceberg MERGE):
 
   1. 100 messages -> 100 observations in Bronze and Silver.
   2. Crash after the Iceberg commit, before the checkpoint commit: the batch's
-     commits/<n> file is removed (exactly what such a crash leaves behind) and the
-     job restarts; the batch is replayed without duplicate rows.
-  3. Crash before / during the Iceberg write: the Spark driver is SIGKILLed in the
-     middle of a multi-batch run (twice), then restarted; nothing lost or doubled.
+     commits/<n> file is removed (exactly what such a crash leaves behind; the
+     test checks it is gone) and the job restarts; replayed without duplicates.
+  3. Crash before / during the Iceberg write: the Bronze driver is SIGKILLed in
+     the middle of a multi-batch run (twice) and the Silver driver while its MERGE
+     runs; the checkpoint must show a planned but uncommitted batch each time.
   4. Restart after the checkpoint is complete: no batch is reprocessed.
-  5. MinIO unavailable (docker pause) while the job runs: how Spark fails, and
-     that the next run recovers everything.
+  5. MinIO unavailable in the middle of a run (docker pause after the first
+     batch): how Spark fails, and that the next run recovers everything.
+  6. Bronze snapshots the Silver checkpoint still needs are expired: the Silver
+     query cannot continue; `silver_status.py --rebuild` with a new checkpoint
+     restores Silver and keeps streaming.
 
 After every scenario: Bronze rows per partition == Kafka end offsets, no
 (topic, partition, offset) twice, Silver rows == distinct keys == keys produced.
 
-Run from the repository root on a separate Compose project (host Python needs
-confluent-kafka):
+Safety: it pauses MinIO and kills Spark drivers, so it only runs when
+COMPOSE_PROJECT_NAME ends with "-itest"; topic, tables and checkpoints carry a
+per-run suffix, and only drivers started with this run's checkpoint are killed.
+
+Run from the repository root (host Python needs confluent-kafka):
 
     export COMPOSE_PROJECT_NAME=citibike-itest
     export MINIO_API_PORT=59000 MINIO_CONSOLE_PORT=59001 ICEBERG_REST_PORT=58181 \\
@@ -27,33 +34,50 @@ confluent-kafka):
         iceberg-rest catalog-init spark-master
     python -m unittest tests.integration.test_spark_recovery -v
     docker compose --profile pipeline down -v
+
+Full Spark output of every step is kept in the directory printed at start.
 """
 import json
 import os
 import subprocess
+import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from confluent_kafka import Consumer, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 
-KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+# 127.0.0.1, not localhost: on some hosts localhost resolves to IPv6 first and the
+# broker's advertised EXTERNAL listener is IPv4.
+KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")
+PROJECT = os.getenv("COMPOSE_PROJECT_NAME", "")
 RUN = str(int(time.time()))
-TOPIC = "gbfs.station_status.str12test"
-BRONZE = "lakehouse.bronze.gbfs_status_str12test"
-SILVER = "lakehouse.silver.gbfs_status_str12test"
+TOPIC = f"gbfs.station_status.str12test.{RUN}"
+BRONZE = f"lakehouse.bronze.gbfs_status_str12test_{RUN}"
+SILVER = f"lakehouse.silver.gbfs_status_str12test_{RUN}"
 CKPT = f"s3a://checkpoints/str12-{RUN}"
+REBUILD_CKPT = f"s3a://checkpoints/str12-{RUN}-rebuild"
 BRONZE_CKPT = f"{CKPT}/status"
-SILVER_CKPT = f"{CKPT}/silver_status"
 JOBS = "/opt/project/streaming/jobs"
 HELPER = "/opt/project/tests/integration/str12_helper.py"
 JOB_ENV = {"GBFS_STATUS_TOPIC": TOPIC, "BRONZE_STATUS_TABLE": BRONZE,
            "SILVER_STATUS_TABLE": SILVER}
+LOG_DIR = Path(tempfile.mkdtemp(prefix="str12-"))
+_log_count = 0
 
 
 def log(message):
     print(f"    {message}", flush=True)
+
+
+def save_log(name, text):
+    global _log_count
+    _log_count += 1
+    path = LOG_DIR / f"{_log_count:02d}-{name}.log"
+    path.write_text(text)
+    return path
 
 
 def compose(*args, check=True, timeout=None):
@@ -69,16 +93,17 @@ def spark_cmd(script, *args, env=None):
             "/opt/spark/bin/spark-submit", script, *args]
 
 
-def spark(script, *args, env=None, timeout=600):
+def spark(name, script, *args, env=None, timeout=600):
     run = subprocess.run(spark_cmd(script, *args, env=env), capture_output=True, text=True,
                          timeout=timeout)
-    return run.returncode, run.stdout + run.stderr
+    out = run.stdout + run.stderr
+    return run.returncode, out, save_log(name, out)
 
 
 def helper(*args):
-    code, out = spark(HELPER, *args)
+    code, out, path = spark(f"helper-{args[0]}", HELPER, *args)
     if code != 0:
-        raise RuntimeError(f"helper {args} failed:\n{out[-3000:]}")
+        raise RuntimeError(f"helper {args} failed (log {path}):\n{out[-2000:]}")
     for line in out.splitlines():
         if line.startswith("STR12_RESULT "):
             return json.loads(line[len("STR12_RESULT "):])
@@ -90,20 +115,22 @@ def bronze_job(env=None):
             "--available-now", "--checkpoint-dir", CKPT], env
 
 
-def silver_job():
-    return [f"{JOBS}/silver_status.py", "--available-now", "--checkpoint-dir", CKPT], None
+def silver_job(root=CKPT, rebuild=False):
+    return ([f"{JOBS}/silver_status.py", "--available-now", "--checkpoint-dir", root]
+            + (["--rebuild"] if rebuild else [])), None
 
 
-def run_ok(job, timeout=600):
+def run_ok(name, job, timeout=600):
     (script, *args), env = job
-    code, out = spark(script, *args, env=env, timeout=timeout)
+    code, out, path = spark(name, script, *args, env=env, timeout=timeout)
     if code != 0:
-        raise AssertionError(f"{script} failed (exit {code}):\n{out[-3000:]}")
+        raise AssertionError(f"{name} failed (exit {code}, log {path}):\n{out[-2000:]}")
     return out
 
 
-def kill_driver(script_name):
-    """SIGKILL the Spark driver (JVM and Python) running `script_name`."""
+def kill_driver():
+    """SIGKILL the Spark driver (JVM and Python) of this run only: its command line
+    carries this run's checkpoint path."""
     code = (
         "import os, signal\n"
         "me = os.getpid()\n"
@@ -112,10 +139,33 @@ def kill_driver(script_name):
         "        cmd = open(f'/proc/{pid}/cmdline', 'rb').read()\n"
         "    except OSError:\n"
         "        continue\n"
-        f"    if int(pid) != me and b'{script_name}' in cmd and b'python3 -c' not in cmd:\n"
+        f"    if int(pid) != me and b'{CKPT}' in cmd:\n"
         "        os.kill(int(pid), signal.SIGKILL)\n"
+        "        print(pid)\n"
     )
-    compose("exec", "-T", "spark-master", "python3", "-c", code)
+    killed = compose("exec", "-T", "spark-master", "python3", "-c", code).stdout.split()
+    if not killed:
+        raise AssertionError("no driver of this run was running")
+    return killed
+
+
+def start_and_kill_on(name, job, trigger_prefix, after=1):
+    """Start the job, SIGKILL its driver when `trigger_prefix` was printed `after` times."""
+    (script, *args), env = job
+    process = subprocess.Popen(spark_cmd(script, *args, env=env), text=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    seen, lines = 0, []
+    for line in process.stdout:
+        lines.append(line)
+        if line.startswith(trigger_prefix):
+            seen += 1
+            if seen >= after:
+                kill_driver()
+                break
+    lines.append(process.stdout.read())
+    process.stdout.close()
+    code = process.wait(timeout=120)
+    return code, save_log(name, "".join(lines))
 
 
 def end_offsets():
@@ -128,12 +178,22 @@ def end_offsets():
         consumer.close()
 
 
+def uncommitted(directory):
+    batches = helper("batches", directory)
+    return sorted(set(batches["offsets"]) - set(batches["commits"]))
+
+
 class SparkRecoveryTest(unittest.TestCase):
     produced_keys = 0
     base = datetime.now(timezone.utc).replace(microsecond=0)
 
     @classmethod
     def setUpClass(cls):
+        if not PROJECT.endswith("-itest"):
+            raise unittest.SkipTest(
+                "pauses MinIO and kills Spark drivers: set COMPOSE_PROJECT_NAME=<name>-itest "
+                "to run it on a throw-away Compose project")
+        print(f"\n    logs: {LOG_DIR}", flush=True)
         admin = AdminClient({"bootstrap.servers": KAFKA})
         admin.create_topics([NewTopic(TOPIC, num_partitions=3, replication_factor=1)])[TOPIC] \
             .result(timeout=30)
@@ -147,6 +207,7 @@ class SparkRecoveryTest(unittest.TestCase):
         try:
             helper("drop", BRONZE, SILVER)
             helper("rm", CKPT)
+            helper("rm", REBUILD_CKPT)
         except RuntimeError as error:
             print(f"cleanup failed: {error}")
 
@@ -191,126 +252,147 @@ class SparkRecoveryTest(unittest.TestCase):
             self.assertEqual(result["silver"]["distinct_keys"], self.produced_keys)
         return result
 
-    def run_until_progress_then_kill(self, job, batches_done, script_name):
-        """Start the job, SIGKILL its driver after it finished `batches_done` batches,
-        i.e. while the next batch is being planned, read or written."""
-        (script, *args), env = job
-        process = subprocess.Popen(spark_cmd(script, *args, env=env), text=True,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        done = 0
-        for line in process.stdout:
-            if line.startswith("[progress] gbfs_status_bronze batch="):
-                done += 1
-                if done >= batches_done:
-                    kill_driver(script_name)
-                    break
-        process.stdout.read()
-        process.stdout.close()
-        return process.wait(timeout=120)
-
     # ------------------------------------------------------------------ tests
 
     def test_1_hundred_messages_become_hundred_observations(self):
         self.produce(polls=10, stations=10, tag="normal")
-        run_ok(bronze_job())
-        run_ok(silver_job())
+        run_ok("t1-bronze", bronze_job())
+        run_ok("t1-silver", silver_job())
         result = self.assert_integrity("100 messages")
         self.assertEqual(result["bronze"]["rows"], 100)
         self.assertEqual(result["silver"]["rows"], 100)
 
     def test_2_crash_after_iceberg_commit_before_checkpoint_commit(self):
         self.produce(polls=2, stations=50, tag="after-commit")
-        run_ok(bronze_job())
-        run_ok(silver_job())
+        run_ok("t2-bronze", bronze_job())
+        run_ok("t2-silver", silver_job())
         before = self.assert_integrity("before")
 
         for name, directory, job in (("bronze", BRONZE_CKPT, bronze_job()),
-                                     ("silver", SILVER_CKPT, silver_job())):
+                                     ("silver", f"{CKPT}/silver_status", silver_job())):
             batches = helper("batches", directory)
             last = batches["commits"][-1]
             self.assertEqual(batches["offsets"][-1], last)
             # The Iceberg snapshot of batch `last` exists, its checkpoint commit does
             # not: the state a crash right after the Iceberg commit leaves behind.
-            helper("rm", f"{directory}/commits/{last}")
-            log(f"{name}: removed commits/{last} -> replaying batch {last}")
-            run_ok(job)
-            self.assertIn(last, helper("batches", directory)["commits"])
+            self.assertTrue(helper("rm", f"{directory}/commits/{last}")["deleted"])
+            self.assertEqual(uncommitted(directory), [last])
+            log(f"{name}: commits/{last} removed -> replaying batch {last}")
+            run_ok(f"t2-{name}-replay", job)
+            self.assertEqual(uncommitted(directory), [])
 
         after = self.assert_integrity("after replay")
         # Bronze: Iceberg recognises the replayed epoch and does not commit again.
         self.assertEqual(after["bronze"]["snapshots"], before["bronze"]["snapshots"])
 
-    def test_3_driver_killed_mid_run_then_restarted(self):
+    def test_3_drivers_killed_mid_run_then_restarted(self):
         self.produce(polls=20, stations=1000, tag="sigkill")     # 20 000 messages
         small_batches = {"MAX_OFFSETS_PER_TRIGGER": "2000"}       # ~10 micro-batches
         total = sum(end_offsets().values())
 
         for kill_after in (1, 4):
             before = self.stats()["bronze"]["rows"]
-            job = bronze_job(small_batches)
-            code = self.run_until_progress_then_kill(job, kill_after, "gbfs_history.py")
-            batches = helper("batches", BRONZE_CKPT)
+            code, path = start_and_kill_on(f"t3-bronze-kill-{kill_after}",
+                                           bronze_job(small_batches),
+                                           "[progress] gbfs_status_bronze", kill_after)
+            pending = uncommitted(BRONZE_CKPT)
             bronze = self.stats()["bronze"]
-            planned_not_committed = sorted(set(batches["offsets"]) - set(batches["commits"]))
-            log(f"killed after {kill_after} batch(es): exit {code}, bronze rows "
+            log(f"bronze killed after {kill_after} batch(es): exit {code}, rows "
                 f"{before} -> {bronze['rows']} of {total}, dup {bronze['duplicate_offsets']}, "
-                f"planned but not committed: {planned_not_committed}")
+                f"planned but not committed {pending} (log {path})")
             self.assertNotEqual(code, 0)
             self.assertEqual(bronze["duplicate_offsets"], 0)
+            self.assertLess(before, bronze["rows"])
             self.assertLess(bronze["rows"], total)
+        run_ok("t3-bronze-finish", bronze_job(small_batches))
 
-        run_ok(bronze_job(small_batches))
-
-        # Silver: kill while its MERGE batch runs, then restart.
-        process = subprocess.Popen(spark_cmd(*silver_job()[0]), text=True,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        for line in process.stdout:
-            if line.startswith("started silver"):
-                time.sleep(8)
-                kill_driver("silver_status.py")
-                break
-        process.stdout.read()
-        process.stdout.close()
-        log(f"silver killed during MERGE: exit {process.wait(timeout=120)}")
-        run_ok(silver_job())
+        # Silver: kill while the MERGE of its batch runs (the job prints
+        # "[silver] merge ..." right before it), then restart.
+        code, path = start_and_kill_on("t3-silver-kill", silver_job(), "[silver] merge")
+        pending = uncommitted(f"{CKPT}/silver_status")
+        log(f"silver killed during MERGE: exit {code}, planned but not committed {pending} "
+            f"(log {path})")
+        self.assertNotEqual(code, 0)
+        self.assertTrue(pending, "the Silver batch was committed before the kill")
+        run_ok("t3-silver-finish", silver_job())
         self.assert_integrity("after kills and restart")
 
     def test_4_restart_after_completed_checkpoint_reprocesses_nothing(self):
         before = self.stats()
         bronze_batches = helper("batches", BRONZE_CKPT)
-        run_ok(bronze_job())
-        run_ok(silver_job())
+        run_ok("t4-bronze", bronze_job())
+        run_ok("t4-silver", silver_job())
         after = self.assert_integrity("restart, nothing new")
         self.assertEqual(after["bronze"]["snapshots"], before["bronze"]["snapshots"])
         self.assertEqual(helper("batches", BRONZE_CKPT), bronze_batches)
 
-    def test_5_minio_unavailable_then_back(self):
-        self.produce(polls=2, stations=500, tag="minio-outage")
-        compose("pause", "minio")
-        started = time.monotonic()
+    def test_5_minio_lost_in_the_middle_of_a_run(self):
+        self.produce(polls=10, stations=1000, tag="minio-outage")   # 10 000 messages
+        before = self.stats()["bronze"]["rows"]
+        total = sum(end_offsets().values())
+        (script, *args), env = bronze_job({"MAX_OFFSETS_PER_TRIGGER": "2000"})
+        process = subprocess.Popen(spark_cmd(script, *args, env=env), text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        lines, paused_at = [], None
         try:
-            (script, *args), env = bronze_job()
+            for line in process.stdout:
+                lines.append(line)
+                if line.startswith("[progress] gbfs_status_bronze"):
+                    compose("pause", "minio")       # after the first committed batch
+                    paused_at = time.monotonic()
+                    break
             try:
-                code, out = spark(script, *args, env=env, timeout=240)
-                outcome = f"exit {code} after {time.monotonic() - started:.0f}s"
-                errors = [l.strip() for l in out.splitlines()
-                          if "Exception" in l and not l.strip().startswith("at ")][:2]
+                lines.append(process.communicate(timeout=300)[0])
+                outcome = f"exit {process.returncode} {time.monotonic() - paused_at:.0f}s after the pause"
             except subprocess.TimeoutExpired:
-                kill_driver("gbfs_history.py")
-                code, errors = None, []
-                outcome = "still waiting/retrying after 240s, killed"
-            log(f"MinIO paused: {outcome}; {errors}")
+                kill_driver()
+                lines.append(process.communicate()[0])
+                outcome = "still retrying 300s after the pause, killed"
         finally:
             compose("unpause", "minio")
-        self.assertNotEqual(code, 0)
+        path = save_log("t5-bronze-minio-paused", "".join(lines))
+        errors = [l.strip() for l in "".join(lines).splitlines()
+                  if ("Exception" in l or "Error" in l) and not l.strip().startswith("at ")][:2]
+        log(f"MinIO paused mid-run: {outcome}; {errors} (log {path})")
+        self.assertIsNotNone(paused_at, "the run ended before its first batch")
+        self.assertNotEqual(process.returncode, 0)
 
         for _ in range(60):   # MinIO healthy again
             if compose("ps", "--format", "{{.Health}}", "minio").stdout.strip() == "healthy":
                 break
             time.sleep(2)
-        run_ok(bronze_job())
-        run_ok(silver_job())
+        mid = self.stats()["bronze"]["rows"]
+        log(f"bronze rows before the run {before}, when MinIO came back {mid}, Kafka {total}")
+        self.assertLess(before, mid)       # batches before the pause were committed
+        self.assertLess(mid, total)        # the outage stopped the run part way
+        run_ok("t5-bronze-after", bronze_job())
+        run_ok("t5-silver-after", silver_job())
         self.assert_integrity("after MinIO is back")
+
+    def test_6_expired_bronze_snapshots_then_silver_rebuild(self):
+        self.produce(polls=2, stations=100, tag="expire-a")
+        run_ok("t6-bronze-a", bronze_job())
+        run_ok("t6-silver-a", silver_job())
+        self.produce(polls=2, stations=100, tag="expire-b")
+        run_ok("t6-bronze-b", bronze_job())
+
+        # Silver has not read "expire-b" yet; expire every Bronze snapshot but the
+        # current one, including those its checkpoint points at.
+        expired = helper("expire", BRONZE)
+        log(f"expired Bronze snapshots: {expired}")
+        self.assertEqual(expired["snapshots"], 1)
+        code, _, path = spark("t6-silver-old-checkpoint", *silver_job()[0])
+        log(f"Silver with the old checkpoint after expiry: exit {code} (log {path})")
+        self.assertNotEqual(code, 0)
+
+        run_ok("t6-silver-rebuild", silver_job(REBUILD_CKPT, rebuild=True))
+        self.assert_integrity("after rebuild")
+
+        # The new checkpoint keeps streaming later Bronze commits.
+        self.produce(polls=1, stations=100, tag="expire-c")
+        run_ok("t6-bronze-c", bronze_job())
+        run_ok("t6-silver-c", silver_job(REBUILD_CKPT))
+        self.assert_integrity("new checkpoint continues")
 
 
 if __name__ == "__main__":
