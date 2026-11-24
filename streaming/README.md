@@ -176,6 +176,10 @@ bash tests/integration/str09_silver.sh
 
 # Integration STR-10: Silver information đủ trường, snapshot, dedup, idempotent, DQ gate
 bash tests/integration/str10_silver_information.sh
+
+# STR-12: crash/restart Spark, replay, Iceberg không ghi trùng (Python trên host cần
+# confluent-kafka; khoảng 13 phút; topic, bảng, checkpoint riêng, tự xoá)
+python -m unittest tests.integration.test_spark_recovery -v
 ```
 
 `test_matches_producer_json_schemas` so tên field với `ingestion/gbfs/json_schemas/*.schema.json` của producer; test này tự skip khi các file đó chưa có trên nhánh.
@@ -232,3 +236,25 @@ Chưa kiểm tra: đọc Silver bằng Trino; xóa snapshot cũ của Bronze (ma
 | Chạy thật **với trigger 5 phút mặc định**, khoảng 17 phút (poller dừng ở phút 11) | Trigger ở 00:35:00, 00:40:00, 00:45:00, 00:50:00. Batch Bronze status 12 595 dòng mỗi trigger (lớn hơn giới hạn 5000 cũ). Cuối lượt: `bronze.gbfs_status` 30 228 dòng = end offset Kafka từng partition (10104 / 10284 / 9840), 0 offset trùng; `bronze.gbfs_station_information` 2519 = end offset; `silver.gbfs_status` 30 228 = 12 lần polling × 2519; DQ `silver_status` và `silver_information` PASS |
 | Hai query dùng chung checkpoint (`STATUS_` và `SILVER_STATUS_CHECKPOINT_LOCATION` cùng một đường dẫn) | Job dừng với `invalid streaming setup: gbfs_status_bronze and gbfs_status_silver share a checkpoint`, không query nào được start |
 | Hồi quy `str08_bronze.sh`, `str09_silver.sh` | 3/3, 7/7 |
+
+## Chịu lỗi Spark → Iceberg (STR-12)
+
+`tests/integration/test_spark_recovery.py` chạy các kịch bản của contract mục 2.4 bằng lỗi thật trên stack thật, cho cả Bronze (Kafka → Iceberg append) và Silver (Bronze → Iceberg MERGE). Sau mỗi kịch bản kiểm tra: Bronze theo từng partition bằng end offset Kafka, không có `(topic, partition, offset)` trùng, Silver có đúng số khóa đã gửi.
+
+| Kịch bản (contract 2.4) | Cách gây lỗi | Kết quả (24/11/2026) |
+|---|---|---|
+| Chạy bình thường 100 message | — | Bronze 100 dòng (30 / 40 / 30 = end offset), Silver 100 |
+| Crash **sau Iceberg commit, trước checkpoint commit** | Xóa `commits/<n>` của batch cuối (đúng trạng thái crash đó để lại), chạy lại | Spark chạy lại batch `n`; Bronze vẫn 200 dòng và **không thêm snapshot** (Iceberg nhận ra epoch đã commit và bỏ qua); Silver vẫn 200 (MERGE chỉ insert) |
+| Crash **trước khi ghi Iceberg** | SIGKILL driver sau 1 batch, rồi sau 4 batch, trong lượt 20 000 message (`MAX_OFFSETS_PER_TRIGGER=2000`); SIGKILL driver Silver giữa MERGE | Exit 137. Checkpoint có `offsets/3` (rồi `offsets/7`) mà chưa có `commits/`: batch đã lên kế hoạch nhưng chưa ghi; Bronze dừng ở 2 200 rồi 10 200 dòng (chỉ các batch đã commit), 0 trùng. Chạy lại: Bronze 20 200 = end offset từng partition, Silver 20 200 |
+| Crash **sau khi checkpoint hoàn tất** | Chạy lại khi không có dữ liệu mới | Không batch mới, không snapshot mới, danh sách `offsets/` `commits/` không đổi |
+| **MinIO tạm mất** | `docker pause minio` trong lúc job chạy | Job lỗi sau khoảng 190 giây (`RESTException`, `SocketTimeoutException` khi Iceberg REST catalog đọc metadata), exit 1. Bật lại MinIO và chạy lại: Bronze 21 200 = end offset, Silver 21 200, 0 trùng |
+
+| Tiêu chí | Kết luận |
+|---|---|
+| Fault tolerance | Phục hồi sau SIGKILL và sau khi MinIO mất, không cần thao tác tay ngoài việc chạy lại (service: `restart: unless-stopped`) |
+| Offset recovery | Đọc tiếp đúng vị trí: số dòng Bronze khớp end offset từng partition sau mọi lần restart |
+| Replay | Batch đã lên kế hoạch mà chưa commit được xử lý lại với đúng offset trong `offsets/<n>` |
+| Idempotency | Bronze: Iceberg bỏ qua epoch đã commit. Silver: MERGE chỉ insert theo `(station_id, poll_id)` |
+| Data integrity | Không mất, không nhân đôi observation trong mọi kịch bản |
+
+Khi MinIO mất, service `spark-streaming` thoát với lỗi sau vài phút và được Docker khởi động lại liên tục (`unless-stopped`) cho tới khi MinIO trở lại; checkpoint bảo đảm đọc tiếp đúng chỗ.
