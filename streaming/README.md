@@ -135,6 +135,26 @@ docker compose --profile pipeline up -d spark-streaming
 | `--checkpoint-dir DIR` | Mỗi feed một thư mục `DIR/<feed>`. Không truyền thì Bronze dùng `STATUS_/INFORMATION_CHECKPOINT_LOCATION`, còn console dùng thư mục tạm và luôn đọc lại từ `STARTING_OFFSETS` |
 | `--available-now` | Xử lý hết dữ liệu đang có trong Kafka rồi dừng (dùng cho test restart) |
 
+## Queries, checkpoint và trigger (STR-11)
+
+Service `spark-streaming` chạy **một ứng dụng Spark với 4 query**, mỗi query một checkpoint riêng trên MinIO:
+
+| Query | Đọc | Ghi | Checkpoint |
+|---|---|---|---|
+| `gbfs_status_bronze` | Kafka `gbfs.station_status` | `bronze.gbfs_status` | `s3a://checkpoints/status-history/` |
+| `gbfs_information_bronze` | Kafka `gbfs.station_information` | `bronze.gbfs_station_information` | `s3a://checkpoints/information-history/` |
+| `gbfs_status_silver` | `bronze.gbfs_status` | `silver.gbfs_status` | `s3a://checkpoints/silver-status/` |
+| `gbfs_information_silver` | `bronze.gbfs_station_information` | `silver.gbfs_station_information` | `s3a://checkpoints/silver-information/` |
+
+Hai query "history" của contract mục 2.3.4 là hai query Bronze; hai query Silver đọc tiếp từ Bronze.
+
+- **Trigger:** `STREAM_TRIGGER_INTERVAL`, mặc định **5 phút** (contract 2.3.3). Spark căn trigger theo mốc thời gian (…:00, …:05, …:10). Silver đọc phần Bronze đã commit ở trigger trước, nên Silver trễ Bronze 5–10 phút.
+- **Kiểm tra trước khi chạy:** job in kế hoạch (`[plan] <query>: checkpoint=… trigger=… maxOffsetsPerTrigger=…`) và **dừng trước khi start bất kỳ query nào** nếu một query thiếu checkpoint hoặc hai query dùng chung / lồng checkpoint nhau.
+- **`MAX_OFFSETS_PER_TRIGGER` = 100000** (mỗi query Kafka, mỗi micro-batch). Trigger theo thời gian không chạy dồn để đuổi kịp, nên giới hạn này phải lớn hơn số message đến trong một trigger: status khoảng 2519 × 5 = 12 595 message mỗi 5 phút. Với giới hạn cũ 5000, query status tụt thêm khoảng 7 600 message mỗi trigger (khoảng 2,2 triệu mỗi ngày). 100000 cũng đủ để đuổi kịp backlog (ví dụ sau khi Spark dừng) nhanh gấp khoảng 8 lần tốc độ đến.
+- **Kafka group:** mỗi query dùng group-id prefix `<KAFKA_GROUP_ID>-<feed>`. Spark tự gán partition và giữ offset trong checkpoint, không commit lên Kafka, nên các group này không xuất hiện trong `kafka-consumer-groups --list`; độ trễ đọc theo dõi bằng log tiến độ.
+- **Log tiến độ:** mỗi micro-batch một dòng `[progress] <query> batch=<n> at=<thời điểm> input_rows=<n> duration_ms=<n>`.
+- **Restart:** `restart: unless-stopped`. Offset và tiến độ nằm trong checkpoint nên khởi động lại thì đọc tiếp, không trùng (xem STR-08, STR-09).
+
 Biến môi trường dùng đúng tên trong `docker-compose.yml`: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_GROUP_ID`, `GBFS_STATUS_TOPIC`, `GBFS_INFORMATION_TOPIC`, `STREAM_TRIGGER_INTERVAL` (mặc định 5 phút), `STATUS_CHECKPOINT_LOCATION`, `INFORMATION_CHECKPOINT_LOCATION`, cùng `STARTING_OFFSETS`, `MAX_OFFSETS_PER_TRIGGER`, `BRONZE_STATUS_TABLE`, `BRONZE_INFORMATION_TABLE`.
 
 ## Test
@@ -203,3 +223,12 @@ Chưa kiểm tra: đọc Silver bằng Trino; xóa snapshot cũ của Bronze (ma
 | `tests/integration/str10_silver_information.sh` | 7/7: đủ trường; replay dedup; trạm đổi tên ở snapshot sau vẫn giữ cả hai phiên bản; message sai (lat 95, thiếu `poll_id`, không phải JSON) bị loại; chạy lại / mất checkpoint không thêm dòng; DQ exit 1 khi chèn dòng trùng |
 | `tests/integration/str09_silver.sh` (hồi quy sau khi tách `jobs/silver.py`) | 7/7 |
 | Dữ liệu thật: poller → Kafka → `spark-streaming` (Bronze + 2 query Silver), poller khởi động lại để có snapshot thứ hai | `silver.gbfs_station_information` 5038 dòng = 2 snapshot × 2519; `region_id` khác null 5014 = 2 × 2507 (12 trạm nguồn không có `region_id`), `rental_uris` và `is_charging` 5038; DQ `silver_information` 8/8 và `silver_status` 7/7 PASS |
+
+### Kết quả STR-11 (24/11/2026)
+
+| Kiểm tra | Kết quả |
+|---|---|
+| Spark unit tests (`tests/streaming`) | 50/50 pass (thêm 8 test kế hoạch query: 4 query với checkpoint riêng, `--checkpoint-dir`, `--available-now`/`--no-silver` chỉ chạy Bronze, console không cần checkpoint, từ chối khi thiếu / dùng chung / lồng checkpoint, mặc định trigger 5 phút và giới hạn offset đủ lớn) |
+| Chạy thật **với trigger 5 phút mặc định**, khoảng 17 phút (poller dừng ở phút 11) | Trigger ở 00:35:00, 00:40:00, 00:45:00, 00:50:00. Batch Bronze status 12 595 dòng mỗi trigger (lớn hơn giới hạn 5000 cũ). Cuối lượt: `bronze.gbfs_status` 30 228 dòng = end offset Kafka từng partition (10104 / 10284 / 9840), 0 offset trùng; `bronze.gbfs_station_information` 2519 = end offset; `silver.gbfs_status` 30 228 = 12 lần polling × 2519; DQ `silver_status` và `silver_information` PASS |
+| Hai query dùng chung checkpoint (`STATUS_` và `SILVER_STATUS_CHECKPOINT_LOCATION` cùng một đường dẫn) | Job dừng với `invalid streaming setup: gbfs_status_bronze and gbfs_status_silver share a checkpoint`, không query nào được start |
+| Hồi quy `str08_bronze.sh`, `str09_silver.sh` | 3/3, 7/7 |

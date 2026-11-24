@@ -411,7 +411,9 @@ services:
     <<: *spark
     profiles: [pipeline]
     hostname: spark-streaming
-    restart: on-failure:5
+    # Offsets and progress live in the checkpoints, so a restart resumes where the
+    # queries stopped; keep restarting (on-failure:5 gave up after a few seconds).
+    restart: unless-stopped
     environment:
       <<: *spark-env
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
@@ -423,6 +425,8 @@ services:
       SILVER_STATUS_CHECKPOINT_LOCATION: s3a://checkpoints/silver-status/
       SILVER_INFORMATION_CHECKPOINT_LOCATION: s3a://checkpoints/silver-information/
       STREAM_TRIGGER_INTERVAL: ${STREAM_TRIGGER_INTERVAL:-5 minutes}
+      # Must exceed the messages arriving per trigger (status ~12600 per 5 minutes).
+      MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-100000}
     entrypoint: [/opt/spark/bin/spark-submit]
     command: [--master, 'spark://spark-master:7077', --deploy-mode, client, --conf, spark.driver.host=spark-streaming, --conf, spark.driver.bindAddress=0.0.0.0, /opt/project/streaming/jobs/gbfs_history.py]
     depends_on:

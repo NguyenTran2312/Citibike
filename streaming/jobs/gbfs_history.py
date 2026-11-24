@@ -23,12 +23,15 @@ Run inside the spark containers (see streaming/README.md):
 
 Environment (names match docker-compose.yml):
   KAFKA_BOOTSTRAP_SERVERS   default kafka:29092
-  KAFKA_GROUP_ID            used as groupIdPrefix (Spark adds a unique suffix per query)
+  KAFKA_GROUP_ID            groupIdPrefix; each query uses <KAFKA_GROUP_ID>-<feed> and Spark
+                            adds a unique suffix. Spark assigns partitions itself and keeps
+                            offsets in the checkpoint, so these groups commit nothing and do
+                            not show up in kafka-consumer-groups --list.
   GBFS_STATUS_TOPIC         default gbfs.station_status
   GBFS_INFORMATION_TOPIC    default gbfs.station_information
   STREAM_TRIGGER_INTERVAL   default "5 minutes" (contract 2.3.3); use "30 seconds" to debug
   STARTING_OFFSETS          default earliest (first run only; then the checkpoint wins)
-  MAX_OFFSETS_PER_TRIGGER   default 5000
+  MAX_OFFSETS_PER_TRIGGER   default 100000 per query and micro-batch (see below)
   STATUS_CHECKPOINT_LOCATION / INFORMATION_CHECKPOINT_LOCATION
                             checkpoints of the Bronze queries (one per feed)
   BRONZE_STATUS_TABLE       default lakehouse.bronze.gbfs_status
@@ -44,6 +47,7 @@ from typing import Callable, Dict, List, NamedTuple, Tuple
 
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.streaming import StreamingQueryListener
 from pyspark.sql.types import StringType, StructField, StructType
 
 from streaming.utils.schemas import (
@@ -61,7 +65,12 @@ STATUS_TOPIC = os.environ.get("GBFS_STATUS_TOPIC", TOPIC_STATION_STATUS)
 INFORMATION_TOPIC = os.environ.get("GBFS_INFORMATION_TOPIC", TOPIC_STATION_INFORMATION)
 TRIGGER_INTERVAL = os.environ.get("STREAM_TRIGGER_INTERVAL", "5 minutes")
 STARTING_OFFSETS = os.environ.get("STARTING_OFFSETS", "earliest")
-MAX_OFFSETS_PER_TRIGGER = int(os.environ.get("MAX_OFFSETS_PER_TRIGGER", "5000"))
+# A processingTime trigger never runs batches back to back to catch up, so this
+# limit must exceed what arrives in one trigger: station_status is ~2519 messages
+# per minute, i.e. ~12600 per 5-minute trigger. With the old 5000 the status query
+# fell ~7600 messages further behind every trigger. 100000 also drains a backlog
+# (e.g. after Spark was down) at ~8x the arrival rate.
+MAX_OFFSETS_PER_TRIGGER = int(os.environ.get("MAX_OFFSETS_PER_TRIGGER", "100000"))
 BRONZE_TABLES = {
     "status": os.environ.get("BRONZE_STATUS_TABLE", "lakehouse.bronze.gbfs_status"),
     "information": os.environ.get("BRONZE_INFORMATION_TABLE",
@@ -70,6 +79,10 @@ BRONZE_TABLES = {
 BRONZE_CHECKPOINTS = {
     "status": os.environ.get("STATUS_CHECKPOINT_LOCATION"),
     "information": os.environ.get("INFORMATION_CHECKPOINT_LOCATION"),
+}
+SILVER_CHECKPOINTS = {
+    "status": os.environ.get("SILVER_STATUS_CHECKPOINT_LOCATION"),
+    "information": os.environ.get("SILVER_INFORMATION_CHECKPOINT_LOCATION"),
 }
 
 # error_type values, same vocabulary as the gbfs.invalid contract (docs/contracts.md 2.3.2)
@@ -169,12 +182,15 @@ def build_spark(app_name: str = "gbfs-history") -> SparkSession:
     return spark
 
 
-def read_kafka(spark: SparkSession, topic: str) -> DataFrame:
+def read_kafka(spark: SparkSession, topic: str, feed: str) -> DataFrame:
     return (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
         .option("subscribe", topic)
-        .option("groupIdPrefix", KAFKA_GROUP_ID)
+        # One group-id prefix per query (broker logs, ACLs, quotas). Spark assigns
+        # partitions itself and keeps offsets in the checkpoint: nothing is committed
+        # to Kafka, so consumer lag is read from the query progress, not from Kafka.
+        .option("groupIdPrefix", f"{KAFKA_GROUP_ID}-{feed}")
         .option("startingOffsets", STARTING_OFFSETS)
         .option("maxOffsetsPerTrigger", MAX_OFFSETS_PER_TRIGGER)
         .option("failOnDataLoss", "false")
@@ -321,15 +337,9 @@ def ensure_bronze_table(spark: SparkSession, feed: str) -> str:
     return table
 
 
-def start_bronze_query(spark: SparkSession, feed: str, checkpoint_dir: str | None,
-                       available_now: bool):
-    checkpoint = (f"{checkpoint_dir.rstrip('/')}/{feed}" if checkpoint_dir
-                  else BRONZE_CHECKPOINTS[feed])
-    if not checkpoint:
-        raise SystemExit(f"no checkpoint for {feed}: set {feed.upper()}_CHECKPOINT_LOCATION "
-                         "or --checkpoint-dir")
+def start_bronze_query(spark: SparkSession, feed: str, checkpoint: str, available_now: bool):
     table = ensure_bronze_table(spark, feed)
-    rows = bronze_rows(validate(parse_value(read_kafka(spark, FEEDS[feed].topic),
+    rows = bronze_rows(validate(parse_value(read_kafka(spark, FEEDS[feed].topic, feed),
                                             FEEDS[feed].schema), feed))
     writer = (rows.writeStream.format("iceberg").outputMode("append")
               .queryName(f"gbfs_{feed}_bronze")
@@ -396,20 +406,90 @@ def make_console_batch_writer(feed: str):
     return write_batch
 
 
-def start_console_query(spark: SparkSession, feed: str, checkpoint_dir: str | None,
+def start_console_query(spark: SparkSession, feed: str, checkpoint: str | None,
                         available_now: bool):
-    parsed = parse_value(read_kafka(spark, FEEDS[feed].topic), FEEDS[feed].schema)
+    parsed = parse_value(read_kafka(spark, FEEDS[feed].topic, feed), FEEDS[feed].schema)
     writer = parsed.writeStream.queryName(f"gbfs_{feed}_console").foreachBatch(
         make_console_batch_writer(feed))
     # Test checkpoint only. Never reuse STATUS_/INFORMATION_CHECKPOINT_LOCATION here:
     # those belong to the Iceberg sink, and a console checkpoint would corrupt them.
-    if checkpoint_dir:
-        writer = writer.option("checkpointLocation", f"{checkpoint_dir.rstrip('/')}/{feed}")
+    if checkpoint:
+        writer = writer.option("checkpointLocation", checkpoint)
     if available_now:
         writer = writer.trigger(availableNow=True)  # process what is in Kafka now, then stop
     else:
         writer = writer.trigger(processingTime=TRIGGER_INTERVAL)
     return writer.start()
+
+
+# --- Query plan (STR-11) -----------------------------------------------------------
+class PlannedQuery(NamedTuple):
+    name: str          # Spark query name
+    kind: str          # bronze | silver | console
+    feed: str          # status | information
+    checkpoint: str | None
+
+
+def plan_queries(sink: str, feeds: List[str], checkpoint_dir: str | None,
+                 available_now: bool, with_silver: bool,
+                 bronze_checkpoints: Dict[str, str | None] | None = None,
+                 silver_checkpoints: Dict[str, str | None] | None = None) -> List[PlannedQuery]:
+    """The queries this run starts, each with its own checkpoint (not started yet)."""
+    bronze_checkpoints = BRONZE_CHECKPOINTS if bronze_checkpoints is None else bronze_checkpoints
+    silver_checkpoints = SILVER_CHECKPOINTS if silver_checkpoints is None else silver_checkpoints
+    root = checkpoint_dir.rstrip("/") if checkpoint_dir else None
+    plan = []
+    for feed in feeds:
+        if sink == "console":
+            plan.append(PlannedQuery(f"gbfs_{feed}_console", "console", feed,
+                                     root and f"{root}/{feed}"))
+            continue
+        plan.append(PlannedQuery(f"gbfs_{feed}_bronze", "bronze", feed,
+                                 f"{root}/{feed}" if root else bronze_checkpoints[feed]))
+    # Silver reads the Bronze tables; with --available-now Bronze may not have
+    # committed yet, so run silver_*.py --available-now after Bronze instead.
+    if sink == "bronze" and with_silver and not available_now:
+        for feed in feeds:
+            plan.append(PlannedQuery(f"gbfs_{feed}_silver", "silver", feed,
+                                     f"{root}/silver_{feed}" if root else silver_checkpoints[feed]))
+    return plan
+
+
+def check_plan(plan: List[PlannedQuery]) -> None:
+    """Fail before starting anything if a query has no checkpoint or two queries
+    would share one (contract 2.3.4: one checkpoint per query, never shared)."""
+    errors = []
+    missing = [q.name for q in plan if q.kind != "console" and not q.checkpoint]
+    if missing:
+        errors.append("no checkpoint for " + ", ".join(missing) + " (set the "
+                      "*_CHECKPOINT_LOCATION variables or --checkpoint-dir)")
+    located = [(q.name, q.checkpoint.rstrip("/") + "/") for q in plan if q.checkpoint]
+    for i, (name_a, path_a) in enumerate(located):
+        for name_b, path_b in located[i + 1:]:
+            if path_a.startswith(path_b) or path_b.startswith(path_a):
+                errors.append(f"{name_a} and {name_b} share a checkpoint "
+                              f"({path_a.rstrip('/')} / {path_b.rstrip('/')})")
+    if errors:
+        raise SystemExit("invalid streaming setup: " + "; ".join(errors))
+
+
+class ProgressLogger(StreamingQueryListener):
+    """One log line per micro-batch: shows the trigger cadence and the batch sizes."""
+
+    def onQueryStarted(self, event) -> None:
+        print(f"[query] started {event.name} id={event.id}", flush=True)
+
+    def onQueryProgress(self, event) -> None:
+        p = event.progress
+        print(f"[progress] {p.name} batch={p.batchId} at={p.timestamp} "
+              f"input_rows={p.numInputRows} "
+              f"duration_ms={p.durationMs.get('triggerExecution')}", flush=True)
+
+    def onQueryIdle(self, event) -> None:
+        pass
+
+    def onQueryTerminated(self, event) -> None:
+        print(f"[query] terminated id={event.id} exception={event.exception}", flush=True)
 
 
 def main() -> int:
@@ -438,29 +518,35 @@ def main() -> int:
         return 0 if ok else 1
 
     feeds = STREAM_FEEDS if args.feed == "all" else [args.feed]
-    for feed in feeds:
-        if args.sink == "bronze":
-            start_bronze_query(spark, feed, args.checkpoint_dir, args.available_now)
-            target = BRONZE_TABLES[feed]
-        else:
-            start_console_query(spark, feed, args.checkpoint_dir, args.available_now)
-            target = "console"
-        print(f"started {feed}: {FEEDS[feed].topic} -> {target}", flush=True)
+    plan = plan_queries(args.sink, feeds, args.checkpoint_dir, args.available_now,
+                        with_silver=not args.no_silver)
+    check_plan(plan)
+    trigger = "availableNow" if args.available_now else TRIGGER_INTERVAL
+    for q in plan:
+        print(f"[plan] {q.name}: checkpoint={q.checkpoint} trigger={trigger} "
+              f"maxOffsetsPerTrigger={MAX_OFFSETS_PER_TRIGGER if q.kind != 'silver' else '-'}",
+              flush=True)
+    spark.streams.addListener(ProgressLogger())
 
-    # Silver (STR-09 status, STR-10 information) reads each Bronze table
-    # incrementally in the same application. Not with --available-now: Bronze may
-    # not have committed yet, so run silver_status.py / silver_information.py
-    # --available-now after Bronze instead.
-    if args.sink == "bronze" and not args.available_now and not args.no_silver:
-        from streaming.jobs.silver_information import (SILVER_INFORMATION_TABLE,
-                                                       start_silver_information_query)
-        from streaming.jobs.silver_status import SILVER_STATUS_TABLE, start_silver_status_query
-        silver = {"status": (start_silver_status_query, SILVER_STATUS_TABLE),
-                  "information": (start_silver_information_query, SILVER_INFORMATION_TABLE)}
-        for feed in feeds:
-            start, table = silver[feed]
-            start(spark, args.checkpoint_dir and f"{args.checkpoint_dir.rstrip('/')}/silver_{feed}")
-            print(f"started silver: {BRONZE_TABLES[feed]} -> {table}", flush=True)
+    for q in plan:
+        if q.kind == "bronze":
+            start_bronze_query(spark, q.feed, q.checkpoint, args.available_now)
+            print(f"started {q.feed}: {FEEDS[q.feed].topic} -> {BRONZE_TABLES[q.feed]}", flush=True)
+        elif q.kind == "console":
+            start_console_query(spark, q.feed, q.checkpoint, args.available_now)
+            print(f"started {q.feed}: {FEEDS[q.feed].topic} -> console", flush=True)
+        else:
+            # Silver (STR-09 status, STR-10 information) reads the Bronze table
+            # incrementally in the same application.
+            from streaming.jobs.silver_information import (SILVER_INFORMATION_TABLE,
+                                                           start_silver_information_query)
+            from streaming.jobs.silver_status import (SILVER_STATUS_TABLE,
+                                                      start_silver_status_query)
+            start, table = {"status": (start_silver_status_query, SILVER_STATUS_TABLE),
+                            "information": (start_silver_information_query,
+                                            SILVER_INFORMATION_TABLE)}[q.feed]
+            start(spark, q.checkpoint)
+            print(f"started silver: {BRONZE_TABLES[q.feed]} -> {table}", flush=True)
 
     if args.available_now:
         for q in spark.streams.active:
