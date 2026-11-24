@@ -4,6 +4,7 @@
     str12_helper.py batches <checkpoint_dir>               -> STR12_RESULT {"offsets": [...], "commits": [...]}
     str12_helper.py rm <path>                              -> STR12_RESULT {"deleted": bool}
     str12_helper.py expire <table>                         -> expire all but the current snapshot
+    str12_helper.py compact <table>                        -> rewrite every data file (new snapshot, same rows)
     str12_helper.py drop <table> [<table> ...]             -> DROP TABLE ... PURGE
 """
 import json
@@ -72,9 +73,16 @@ def main() -> None:
                         f"older_than => TIMESTAMP '{cutoff}', retain_last => 1)").first()
         emit({"deleted_manifest_lists": row["deleted_manifest_lists_count"],
               "snapshots": snapshots(spark, args[0])})
+    elif action == "compact":
+        catalog, name = args[0].split(".", 1)
+        row = spark.sql(f"CALL {catalog}.system.rewrite_data_files(table => '{name}', "
+                        "options => map('rewrite-all', 'true'))").first()
+        emit({"rewritten": row["rewritten_data_files_count"],
+              "snapshots": snapshots(spark, args[0])})
     elif action == "drop":
-        for table in args:
-            spark.sql(f"DROP TABLE IF EXISTS {table} PURGE")
+        for table in args:   # a Silver table's poll table goes with it
+            for name in (table, f"{table}_polls"):
+                spark.sql(f"DROP TABLE IF EXISTS {name} PURGE")
     else:
         raise SystemExit(f"unknown action {action}")
 

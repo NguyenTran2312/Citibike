@@ -26,8 +26,9 @@ def main() -> None:
         return
 
     if action == "drop":
-        for table in tables:
-            spark.sql(f"DROP TABLE IF EXISTS {table} PURGE")
+        for table in tables:   # a Silver table's poll table goes with it
+            for name in (table, f"{table}_polls"):
+                spark.sql(f"DROP TABLE IF EXISTS {name} PURGE")
         return
 
     table = tables[0]

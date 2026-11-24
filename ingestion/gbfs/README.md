@@ -358,8 +358,11 @@ vào bucket `raw`, thư mục `gbfs/`.
 
 - Bản ghi trạm sai cấu trúc hoặc vi phạm schema được ghi vào
   `invalid.jsonl` và gửi sang `gbfs.invalid`.
-- Lỗi cấp feed (thiếu `last_updated`, `data.stations` không phải
-  danh sách) làm cả lần polling thất bại và chỉ được ghi log.
+- Lỗi cấp feed (thiếu hoặc sai `last_updated`, ví dụ epoch mili giây;
+  `data.stations` không phải danh sách) làm cả lần polling thất bại và
+  chỉ được ghi log: không có message nào lên Kafka, kể cả `gbfs.invalid`.
+  `raw.json` được giữ lại để kiểm tra (và lưu lên MinIO nếu bật), nhưng
+  không `--replay` được vì không có `valid.jsonl`.
 
 ### Kafka Producer
 

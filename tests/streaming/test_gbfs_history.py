@@ -24,7 +24,8 @@ PRODUCER_SCHEMAS = REPO / "ingestion" / "gbfs" / "json_schemas"
 if SparkSession is not None:
     from streaming.jobs.gbfs_history import (
         BRONZE_COLUMNS, PARSE_ERROR, SCHEMA_ERROR, VALIDATION_ERROR,
-        bronze_rows, invalid_rows, parse_value, valid_rows, validate)
+        bronze_rows, invalid_rows, json_type_errors, parse_value, type_spec, valid_rows,
+        validate)
     from streaming.utils.schemas import (
         INVALID_SCHEMA, STATION_INFORMATION_SCHEMA, STATION_STATUS_SCHEMA)
 
@@ -229,6 +230,57 @@ class ParseValidateTest(unittest.TestCase):
                 self.assertFalse(row.dq_is_valid)
                 self.assertIn(text, row.dq_error_message)
 
+    def test_wrong_types_are_schema_errors(self):
+        row = self._one(_valid_status(station_id=123))
+        self.assertEqual(row.dq_error_type, SCHEMA_ERROR)
+        self.assertEqual(row.dq_error_message,
+                         "JSON does not match schema: station_id must be a JSON string")
+
+    def test_nested_key_with_the_same_name_does_not_hide_a_wrong_type(self):
+        # Codex review: the regex found "station_id":"decoy" inside "extra".
+        msg = _valid_status(station_id=123, extra={"station_id": "decoy"})
+        row = self._one(msg)
+        self.assertFalse(row.dq_is_valid)
+        self.assertIn("station_id must be a JSON string", row.dq_error_message)
+
+    def test_duplicate_keys_are_rejected(self):
+        rest = _valid_status()
+        del rest["station_id"]
+        for keys in ('"station_id": "abc", "station_id": 123',
+                     '"station_id": 123, "station_id": "abc"'):
+            line = "{" + keys + ", " + json.dumps(rest)[1:]
+            with self.subTest(line=line):
+                row = self._one(line)
+                self.assertFalse(row.dq_is_valid)
+                self.assertEqual(row.dq_error_type, SCHEMA_ERROR)
+                self.assertIn("duplicate key station_id", row.dq_error_message)
+
+    def test_unicode_escaped_key_is_the_same_key(self):
+        line = json.dumps(_valid_status()).replace('"station_id"', '"station\\u005fid"')
+        self.assertIn("\\u005f", line)
+        self.assertTrue(self._one(line).dq_is_valid)
+
+    def test_nested_strings_are_type_checked(self):
+        status = _valid_status(vehicle_types_available=[{"vehicle_type_id": 1, "count": 2}])
+        row = self._one(status)
+        self.assertEqual(row.dq_error_type, SCHEMA_ERROR)
+        self.assertIn("vehicle_types_available[0].vehicle_type_id must be a JSON string",
+                      row.dq_error_message)
+        info = _valid_information(rental_uris={"android": 5})
+        row = self._one(info, "information", STATION_INFORMATION_SCHEMA)
+        self.assertEqual(row.dq_error_type, SCHEMA_ERROR)
+        self.assertIn("rental_uris.android must be a JSON string", row.dq_error_message)
+
+    def test_single_quoted_json_is_rejected(self):
+        line = json.dumps(_valid_status()).replace('"', "'")
+        row = self._one(line)
+        self.assertFalse(row.dq_is_valid)
+        self.assertIn("not strict JSON", row.dq_error_message)
+
+    def test_escaped_quotes_in_values_are_accepted(self):
+        info = _valid_information(name='Station "A"')
+        self.assertTrue(self._one(info, "information", STATION_INFORMATION_SCHEMA).dq_is_valid)
+
     def test_strings_with_spaces_around_the_colon_are_accepted(self):
         line = json.dumps(_valid_status()).replace('"station_id": "abc"', '"station_id" :  "abc"')
         self.assertTrue(self._one(line).dq_is_valid)
@@ -362,6 +414,49 @@ class ParseValidateTest(unittest.TestCase):
                                           STATION_STATUS_SCHEMA))
         self.assertEqual(rows.schema["kafka_offset"].dataType.simpleString(), "bigint")
         self.assertTrue(all(r.kafka_offset is None for r in rows.collect()))
+
+
+@unittest.skipIf(SparkSession is None, "pyspark not installed")
+class JsonTypeErrorsTest(unittest.TestCase):
+    """json_type_errors() is plain Python: no Spark session needed."""
+
+    def setUp(self):
+        self.spec = type_spec(STATION_STATUS_SCHEMA)
+
+    def errors(self, doc):
+        return json_type_errors(doc if isinstance(doc, str) else json.dumps(doc), self.spec)
+
+    def test_valid_message_has_no_errors(self):
+        self.assertEqual(self.errors(_valid_status()), [])
+
+    def test_kinds(self):
+        cases = {
+            "num_bikes_available": ("5", "num_bikes_available must be a JSON integer"),
+            "is_renting": (1, "is_renting must be a JSON boolean"),
+            "vehicle_types_available": ({}, "vehicle_types_available must be a JSON array"),
+            "last_reported": (True, "last_reported must be a JSON integer"),
+        }
+        for field, (value, message) in cases.items():
+            with self.subTest(field=field):
+                self.assertEqual(self.errors(_valid_status(**{field: value})), [message])
+
+    def test_numbers_accept_integers_for_doubles(self):
+        spec = type_spec(STATION_INFORMATION_SCHEMA)
+        self.assertEqual(json_type_errors(json.dumps(_valid_information(lat=40)), spec), [])
+
+    def test_nulls_and_unknown_fields_are_left_to_the_rules(self):
+        self.assertEqual(self.errors(_valid_status(station_id=None, extra={"x": 1})), [])
+
+    def test_non_objects_and_empty_text_are_left_to_parse_value(self):
+        for raw in ("", "   ", "[1, 2]", "5"):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.errors(raw), [])
+
+    def test_any_fields_are_not_checked(self):
+        spec = type_spec(INVALID_SCHEMA)
+        doc = json.dumps({"source": "s", "raw_payload": {"a": 1}})
+        self.assertEqual(json_type_errors(doc, spec), ["raw_payload must be a JSON string"])
+        self.assertEqual(json_type_errors(doc, spec, ("raw_payload",)), [])
 
 
 if __name__ == "__main__":

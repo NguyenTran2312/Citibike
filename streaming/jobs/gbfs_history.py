@@ -41,16 +41,30 @@ Environment (names match docker-compose.yml):
 from __future__ import annotations  # apache/spark:3.5.6 ships Python 3.8
 
 import argparse
+import json
 import os
 import sys
-import threading
 from pathlib import Path
 from typing import Callable, Dict, List, NamedTuple, Tuple
 
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQueryListener
-from pyspark.sql.types import StringType, StructField, StructType
+from pyspark.sql.types import (
+    ArrayType,
+    BooleanType,
+    ByteType,
+    DataType,
+    DecimalType,
+    DoubleType,
+    FloatType,
+    IntegerType,
+    LongType,
+    ShortType,
+    StringType,
+    StructField,
+    StructType,
+)
 
 from streaming.utils.schemas import (
     INVALID_SCHEMA,
@@ -125,14 +139,6 @@ def _epoch_seconds(*fields: str) -> List[Rule]:
              f"{f} is not epoch seconds (> {MAX_EPOCH_SECONDS})") for f in fields]
 
 
-def _json_string(*fields: str) -> List[Rule]:
-    """from_json turns 123 or {} into "123" / "{}" for a STRING field, while the
-    producer (Pydantic) rejects them: check the token type in the raw message."""
-    raw = F.col("raw_value")
-    return [(F.col(f).isNotNull() & ~raw.rlike(rf'"{f}"\s*:\s*"'),
-             f"{f} must be a JSON string") for f in fields]
-
-
 def _iso_datetime_with_tz(field: str) -> List[Rule]:
     c = F.col(field)
     return [
@@ -152,7 +158,6 @@ def status_rules() -> List[Rule]:
                   "is_installed", "is_renting", "is_returning", "last_reported",
                   "last_updated", "collected_at")
         + _non_empty("poll_id", "station_id")
-        + _json_string("poll_id", "station_id", "collected_at")
         + _non_negative("num_bikes_available", "num_docks_available",
                         "last_reported", "last_updated")
         + _epoch_seconds("last_reported", "last_updated")
@@ -167,8 +172,6 @@ def information_rules() -> List[Rule]:
     return (
         _required("poll_id", "last_updated", "collected_at", "station_id", "name", "lat", "lon")
         + _non_empty("poll_id", "station_id", "name")
-        + _json_string("poll_id", "station_id", "name", "short_name", "region_id",
-                       "collected_at")
         + _non_negative("last_updated", "capacity")
         + _epoch_seconds("last_updated")
         + _iso_datetime_with_tz("collected_at")
@@ -181,22 +184,120 @@ def invalid_rules() -> List[Rule]:
     return (
         _required("source", "error_type", "error_message", "raw_payload", "detected_at")
         + _non_empty("source", "error_type", "error_message")
-        + _json_string("source", "error_type", "error_message", "detected_at")
         + _iso_datetime_with_tz("detected_at")
     )
+
+
+# --- JSON types (Python, not from_json) -------------------------------------------
+# from_json converts instead of rejecting: 123 or {} become "123" / "{}" in a STRING
+# field, and it accepts single-quoted JSON. The producer (Pydantic, strict) never
+# sends either, so a message whose JSON tokens do not have the schema's types is a
+# SCHEMA_ERROR. Checked with json.loads on raw_value, field by field (nested structs
+# and arrays included); a key that appears twice in one object is rejected too,
+# because from_json would silently keep one of the values.
+TypeSpec = Tuple[str, object]  # (json kind, struct fields | array element | None)
+
+
+def type_spec(dtype: DataType) -> TypeSpec:
+    """Spark type -> plain data the Python workers can check against."""
+    if isinstance(dtype, StructType):
+        return ("object", {f.name: type_spec(f.dataType) for f in dtype.fields})
+    if isinstance(dtype, ArrayType):
+        return ("array", type_spec(dtype.elementType))
+    if isinstance(dtype, StringType):
+        return ("string", None)
+    if isinstance(dtype, BooleanType):
+        return ("boolean", None)
+    if isinstance(dtype, (ByteType, ShortType, IntegerType, LongType)):
+        return ("integer", None)
+    if isinstance(dtype, (FloatType, DoubleType, DecimalType)):
+        return ("number", None)
+    raise TypeError(f"no JSON type check for {dtype}")
+
+
+class _DuplicateKey(ValueError):
+    pass
+
+
+def _no_duplicate_keys(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _DuplicateKey(key)
+        obj[key] = value
+    return obj
+
+
+_KIND_CHECKS = {
+    "string": lambda v: isinstance(v, str),
+    "boolean": lambda v: isinstance(v, bool),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+}
+
+
+def json_type_errors(raw: str | None, spec: TypeSpec, any_fields: Tuple[str, ...] = ()) -> List[str]:
+    """Fields of the JSON object `raw` whose value has another JSON type than `spec`.
+
+    null is accepted everywhere (required fields are checked by the rules), unknown
+    fields are ignored (from_json ignores them too). Empty or non-JSON text and
+    non-objects return [] because validate() reports them as PARSE / SCHEMA errors;
+    text that Spark parsed but json.loads does not (e.g. single quotes) is reported.
+    """
+    if raw is None or not raw.strip():
+        return []
+    try:
+        doc = json.loads(raw, object_pairs_hook=_no_duplicate_keys)
+    except _DuplicateKey as exc:
+        return [f"duplicate key {exc.args[0]}"]
+    except ValueError:
+        return ["payload is not strict JSON"]
+    if not isinstance(doc, dict):
+        return []
+    errors: List[str] = []
+
+    def check(value, node: TypeSpec, path: str) -> None:
+        if value is None:
+            return
+        kind, inner = node
+        if not _KIND_CHECKS[kind](value):
+            errors.append(f"{path} must be a JSON {kind}")
+        elif kind == "object":
+            for name, sub in inner.items():
+                if name in value:
+                    check(value[name], sub, f"{path}.{name}")
+        elif kind == "array":
+            for i, item in enumerate(value):
+                check(item, inner, f"{path}[{i}]")
+
+    for name, sub in spec[1].items():
+        if name in doc and name not in any_fields:
+            check(doc[name], sub, name)
+    return errors
 
 
 class Feed(NamedTuple):
     topic: str
     schema: StructType
     rules: Callable[[], List[Rule]]
+    any_fields: Tuple[str, ...] = ()   # fields whose JSON value may be of any type
+
+
+def json_type_errors_column(feed: str) -> Column:
+    """array<string> of json_type_errors() for raw_value (Python UDF)."""
+    spec = type_spec(FEEDS[feed].schema)
+    any_fields = FEEDS[feed].any_fields
+    check = F.udf(lambda raw: json_type_errors(raw, spec, any_fields), ArrayType(StringType()))
+    return check(F.col("raw_value"))
 
 
 FEEDS: Dict[str, Feed] = {
     "status": Feed(STATUS_TOPIC, STATION_STATUS_SCHEMA, status_rules),
     "information": Feed(INFORMATION_TOPIC, STATION_INFORMATION_SCHEMA, information_rules),
     # Not streamed by this job (the producer writes it); kept for the fixture/contract check.
-    "invalid": Feed(TOPIC_INVALID, INVALID_SCHEMA, invalid_rules),
+    "invalid": Feed(TOPIC_INVALID, INVALID_SCHEMA, invalid_rules, any_fields=("raw_payload",)),
 }
 STREAM_FEEDS = ["status", "information"]
 
@@ -270,10 +371,12 @@ def validate(parsed: DataFrame, feed: str) -> DataFrame:
         F.array(*[F.when(cond, F.lit(msg)) for cond, msg in FEEDS[feed].rules()]),
         lambda m: m.isNotNull(),
     )
+    type_errors = F.col("_json_type_errors")
     error_type = (
         F.when(empty, F.lit(PARSE_ERROR))
         .when(corrupt.isNotNull() & ~is_json, F.lit(PARSE_ERROR))
         .when(corrupt.isNotNull(), F.lit(SCHEMA_ERROR))
+        .when(F.size(type_errors) > 0, F.lit(SCHEMA_ERROR))
         .when(F.size(errors) > 0, F.lit(VALIDATION_ERROR))
     )
     error_message = (
@@ -281,12 +384,16 @@ def validate(parsed: DataFrame, feed: str) -> DataFrame:
         .when(corrupt.isNotNull() & ~is_json, F.lit("payload is not valid JSON"))
         .when(corrupt.isNotNull(),
               F.lit("JSON does not match schema (not an object or a field has the wrong type)"))
+        .when(F.size(type_errors) > 0,
+              F.concat(F.lit("JSON does not match schema: "), F.array_join(type_errors, "; ")))
         .when(F.size(errors) > 0, F.array_join(errors, "; "))
     )
     return (parsed
+            .withColumn("_json_type_errors", json_type_errors_column(feed))
             .withColumn("dq_error_type", error_type)
             .withColumn("dq_error_message", error_message)
-            .withColumn("dq_is_valid", F.col("dq_error_type").isNull()))
+            .withColumn("dq_is_valid", F.col("dq_error_type").isNull())
+            .drop("_json_type_errors"))
 
 
 def valid_rows(validated: DataFrame, feed: str) -> DataFrame:
@@ -365,25 +472,35 @@ def ensure_bronze_table(spark: SparkSession, feed: str) -> str:
     return table
 
 
-# Snapshot property that marks which micro-batch an append came from.
-BATCH_MARKER = "gbfs.source-batch"
+# A Kafka message is identified by its position; kafka_timestamp is part of the key
+# so a topic that was deleted and recreated (offsets start at 0 again) is not
+# mistaken for messages Bronze already has.
+MESSAGE_KEY = ["kafka_topic", "kafka_partition", "kafka_offset", "kafka_timestamp"]
 
 
-def batch_committed(spark: SparkSession, table: str, marker: str) -> bool:
-    """True when a snapshot in the current history carries `marker`."""
-    iceberg = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(
-        spark._jsparkSession, table)
-    snapshot = iceberg.currentSnapshot()
-    while snapshot is not None:
-        if snapshot.summary().get(BATCH_MARKER) == marker:
-            return True
-        parent = snapshot.parentId()
-        snapshot = iceberg.snapshot(parent) if parent is not None else None
-    return False
+def messages_not_in(batch: DataFrame, table: str) -> DataFrame:
+    """Rows of `batch` (Bronze shape) whose Kafka message is not in `table` yet.
+
+    Only the Bronze files whose offset / timestamp ranges overlap the batch are
+    read (Iceberg column statistics), i.e. normally the files of a replayed batch.
+    """
+    # Timestamps as epoch micros: no time-zone conversion between Spark and Python.
+    bounds = batch.agg(F.min("kafka_offset").alias("lo"), F.max("kafka_offset").alias("hi"),
+                       F.min(F.unix_micros("kafka_timestamp")).alias("t_lo"),
+                       F.max(F.unix_micros("kafka_timestamp")).alias("t_hi")).first()
+    if bounds["lo"] is None:
+        return batch
+    existing = (batch.sparkSession.table(table)
+                .where(F.col("kafka_offset").between(F.lit(bounds["lo"]), F.lit(bounds["hi"]))
+                       & F.col("kafka_timestamp").between(
+                           F.timestamp_micros(F.lit(bounds["t_lo"])),
+                           F.timestamp_micros(F.lit(bounds["t_hi"]))))
+                .select(*MESSAGE_KEY))
+    return batch.join(existing, MESSAGE_KEY, "left_anti")
 
 
 def start_bronze_query(spark: SparkSession, feed: str, checkpoint: str, available_now: bool):
-    """Kafka -> Bronze with an idempotent append per micro-batch.
+    """Kafka -> Bronze, every Kafka message exactly once.
 
     Not the Iceberg streaming sink: when a committed micro-batch is replayed in a
     new Spark application (crash after the Iceberg commit, before the checkpoint
@@ -392,28 +509,35 @@ def start_bronze_query(spark: SparkSession, feed: str, checkpoint: str, availabl
     skips the commit, so the committed snapshot points at files whose size changed
     and every read fails (tests/integration/test_spark_recovery.py, scenario 2).
 
-    Here each micro-batch is a normal Iceberg append (fresh file names) tagged with
-    the snapshot property gbfs.source-batch = <query id>:<batch id>. A replayed batch
-    whose marker is already in the table history is skipped. The query id is kept in
-    the checkpoint, so a new checkpoint never matches an old marker.
+    Here each micro-batch is a normal Iceberg append (fresh file names) of the
+    messages Bronze does not have yet (messages_not_in). The proof that a message
+    was written is the row itself, so a replay is safe whatever happened in between:
+    snapshots expired, a checkpoint written by the old Iceberg sink, a lost
+    checkpoint. One writer per Bronze table: two queries appending the same offsets
+    at the same moment could both see them as new.
     """
     table = ensure_bronze_table(spark, feed)
     rows = bronze_rows(validate(parse_value(read_kafka(spark, FEEDS[feed].topic, feed),
                                             FEEDS[feed].schema), feed))
-    started = threading.Event()
-    query_id: Dict[str, str] = {}
 
     def append_batch(batch: DataFrame, batch_id: int) -> None:
-        started.wait()
-        marker = f"{query_id['id']}:{batch_id}"
-        session = batch.sparkSession
-        if batch_committed(session, table, marker):
-            print(f"[bronze] {table}: batch {batch_id} already committed, skipped", flush=True)
-            return
         batch = batch.persist()   # read Kafka once; ingested_at stays the same
         try:
-            if not batch.isEmpty():
-                batch.writeTo(table).option(f"snapshot-property.{BATCH_MARKER}", marker).append()
+            total = batch.count()
+            if not total:
+                return
+            new = messages_not_in(batch, table).persist()
+            try:
+                n_new = new.count()
+                if n_new < total:
+                    print(f"[bronze] {table}: batch {batch_id}: {total - n_new} of {total} "
+                          f"messages already in Bronze, skipped", flush=True)
+                if n_new:
+                    print(f"[bronze] {table}: batch {batch_id}: appending {n_new} messages",
+                          flush=True)
+                    new.writeTo(table).append()
+            finally:
+                new.unpersist()
         finally:
             batch.unpersist()
 
@@ -424,10 +548,7 @@ def start_bronze_query(spark: SparkSession, feed: str, checkpoint: str, availabl
         writer = writer.trigger(availableNow=True)
     else:
         writer = writer.trigger(processingTime=TRIGGER_INTERVAL)
-    query = writer.start()
-    query_id["id"] = query.id
-    started.set()
-    return query
+    return writer.start()
 
 
 # --- Fixture check -------------------------------------------------------------

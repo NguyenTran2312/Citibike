@@ -427,6 +427,8 @@ services:
       STREAM_TRIGGER_INTERVAL: ${STREAM_TRIGGER_INTERVAL:-5 minutes}
       # Must exceed the messages arriving per trigger (status ~12600 per 5 minutes).
       MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-100000}
+      # true: stop when Kafka no longer has offsets a checkpoint needs (streaming/README.md)
+      FAIL_ON_DATA_LOSS: ${FAIL_ON_DATA_LOSS:-true}
     entrypoint: [/opt/spark/bin/spark-submit]
     command: [--master, 'spark://spark-master:7077', --deploy-mode, client, --conf, spark.driver.host=spark-streaming, --conf, spark.driver.bindAddress=0.0.0.0, /opt/project/streaming/jobs/gbfs_history.py]
     depends_on:

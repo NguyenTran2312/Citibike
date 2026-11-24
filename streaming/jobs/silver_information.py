@@ -118,7 +118,7 @@ def main() -> int:
         if not checkpoint:
             raise SystemExit("--rebuild needs a new checkpoint (--checkpoint-dir or "
                              "SILVER_INFORMATION_CHECKPOINT_LOCATION)")
-        from_ms = rebuild(spark, "information", SILVER_INFORMATION_TABLE, SILVER_INFORMATION_DDL, silver_information_rows, checkpoint) + 1
+        from_ms = rebuild(spark, "information", SILVER_INFORMATION_TABLE, SILVER_INFORMATION_DDL, silver_information_rows, checkpoint)
     query = start_silver_information_query(spark, checkpoint, args.available_now, from_ms)
     print(f"started silver: {BRONZE_TABLES['information']} -> {SILVER_INFORMATION_TABLE}",
           flush=True)

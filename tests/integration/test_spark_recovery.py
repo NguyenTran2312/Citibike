@@ -8,15 +8,23 @@ and Silver (Bronze -> Iceberg MERGE):
   2. Crash after the Iceberg commit, before the checkpoint commit: the batch's
      commits/<n> file is removed (exactly what such a crash leaves behind; the
      test checks it is gone) and the job restarts; replayed without duplicates.
-  3. Crash before / during the Iceberg write: the Bronze driver is SIGKILLed in
-     the middle of a multi-batch run (twice) and the Silver driver while its MERGE
-     runs; the checkpoint must show a planned but uncommitted batch each time.
-  4. Restart after the checkpoint is complete: no batch is reprocessed.
+  3. Crash before / during the Iceberg write: the Bronze driver is SIGKILLed when
+     a batch starts its append (first batch, then fourth batch) and the Silver
+     driver when a batch starts its MERGE; the checkpoint must show a planned but
+     uncommitted batch each time (the kill may land just before or just after the
+     Iceberg commit: both must recover without loss or duplicates).
+  4. Restart after the checkpoint is complete: neither Bronze nor Silver
+     reprocesses a batch or commits a snapshot.
   5. MinIO unavailable in the middle of a run (docker pause after the first
      batch): how Spark fails, and that the next run recovers everything.
   6. Bronze snapshots the Silver checkpoint still needs are expired: the Silver
      query cannot continue; `silver_status.py --rebuild` with a new checkpoint
      restores Silver and keeps streaming.
+  7. Crash after the Iceberg commit, and the snapshot of that commit is expired
+     before the restart (compaction + expire_snapshots): the replayed batch still
+     adds nothing, because Bronze recognises messages by their Kafka position in
+     the data, not by snapshot metadata. (The same check covers a checkpoint left
+     by the former Iceberg streaming sink; that case is not run here.)
 
 After every scenario: Bronze rows per partition == Kafka end offsets, no
 (topic, partition, offset) twice, Silver rows == distinct keys == keys produced.
@@ -39,8 +47,10 @@ Full Spark output of every step is kept in the directory printed at start.
 """
 import json
 import os
+import queue
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -149,23 +159,64 @@ def kill_driver():
     return killed
 
 
-def start_and_kill_on(name, job, trigger_prefix, after=1):
-    """Start the job, SIGKILL its driver when `trigger_prefix` was printed `after` times."""
+class Output:
+    """Lines of a running process, read by a thread so every wait has a deadline."""
+
+    def __init__(self, process):
+        self.process, self.lines, self._queue = process, [], queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        with self.process.stdout:
+            for line in self.process.stdout:
+                self._queue.put(line)
+        self._queue.put(None)
+
+    def until(self, match, timeout):
+        """True when a line satisfies `match`, False when the output ends first,
+        None when neither happened within `timeout` seconds."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                line = self._queue.get(timeout=max(0.1, deadline - time.monotonic()))
+            except queue.Empty:
+                if time.monotonic() >= deadline:
+                    return None
+                continue
+            if line is None:
+                return False
+            self.lines.append(line)
+            if match(line):
+                return True
+
+    def text(self):
+        return "".join(self.lines)
+
+
+def start_and_kill_on(name, job, trigger, after=1, timeout=600):
+    """Start the job, SIGKILL its driver once a line containing `trigger` was
+    printed `after` times. Fails if that does not happen within `timeout` s."""
     (script, *args), env = job
     process = subprocess.Popen(spark_cmd(script, *args, env=env), text=True,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    seen, lines = 0, []
-    for line in process.stdout:
-        lines.append(line)
-        if line.startswith(trigger_prefix):
-            seen += 1
-            if seen >= after:
-                kill_driver()
-                break
-    lines.append(process.stdout.read())
-    process.stdout.close()
+    output, seen = Output(process), [0]
+
+    def nth_trigger(line):
+        seen[0] += trigger in line
+        return seen[0] >= after
+
+    found = output.until(nth_trigger, timeout)
+    if found:
+        kill_driver()
+    elif found is None:
+        process.kill()
+    output.until(lambda line: False, 120)
     code = process.wait(timeout=120)
-    return code, save_log(name, "".join(lines))
+    path = save_log(name, output.text())
+    if not found:
+        raise AssertionError(f"{name}: '{trigger}' x{after} not printed "
+                             f"({'timeout' if found is None else f'exit {code}'}, log {path})")
+    return code, path
 
 
 def end_offsets():
@@ -282,7 +333,7 @@ class SparkRecoveryTest(unittest.TestCase):
             self.assertEqual(uncommitted(directory), [])
 
         after = self.assert_integrity("after replay")
-        # Bronze: Iceberg recognises the replayed epoch and does not commit again.
+        # Bronze: the replayed batch finds its messages already there, appends nothing.
         self.assertEqual(after["bronze"]["snapshots"], before["bronze"]["snapshots"])
 
     def test_3_drivers_killed_mid_run_then_restarted(self):
@@ -294,24 +345,26 @@ class SparkRecoveryTest(unittest.TestCase):
             before = self.stats()["bronze"]["rows"]
             code, path = start_and_kill_on(f"t3-bronze-kill-{kill_after}",
                                            bronze_job(small_batches),
-                                           "[progress] gbfs_status_bronze", kill_after)
+                                           "appending", kill_after)   # "batch n: appending N messages"
             pending = uncommitted(BRONZE_CKPT)
             bronze = self.stats()["bronze"]
-            log(f"bronze killed after {kill_after} batch(es): exit {code}, rows "
+            log(f"bronze killed in batch append #{kill_after}: exit {code}, rows "
                 f"{before} -> {bronze['rows']} of {total}, dup {bronze['duplicate_offsets']}, "
                 f"planned but not committed {pending} (log {path})")
             self.assertNotEqual(code, 0)
+            self.assertTrue(pending, "the Bronze batch was committed before the kill")
             self.assertEqual(bronze["duplicate_offsets"], 0)
-            self.assertLess(before, bronze["rows"])
+            if kill_after > 1:   # the batches before the killed one were committed
+                self.assertLess(before, bronze["rows"])
             self.assertLess(bronze["rows"], total)
         run_ok("t3-bronze-finish", bronze_job(small_batches))
 
-        # Silver: kill while the MERGE of its batch runs (the job prints
-        # "[silver] merge ..." right before it), then restart.
+        # Silver: kill when a batch announces its MERGE ("[silver] merge ...", printed
+        # right before the SQL), then restart.
         code, path = start_and_kill_on("t3-silver-kill", silver_job(), "[silver] merge")
         pending = uncommitted(f"{CKPT}/silver_status")
-        log(f"silver killed during MERGE: exit {code}, planned but not committed {pending} "
-            f"(log {path})")
+        log(f"silver killed when its MERGE started: exit {code}, planned but not committed "
+            f"{pending} (log {path})")
         self.assertNotEqual(code, 0)
         self.assertTrue(pending, "the Silver batch was committed before the kill")
         run_ok("t3-silver-finish", silver_job())
@@ -320,11 +373,14 @@ class SparkRecoveryTest(unittest.TestCase):
     def test_4_restart_after_completed_checkpoint_reprocesses_nothing(self):
         before = self.stats()
         bronze_batches = helper("batches", BRONZE_CKPT)
+        silver_batches = helper("batches", f"{CKPT}/silver_status")
         run_ok("t4-bronze", bronze_job())
         run_ok("t4-silver", silver_job())
         after = self.assert_integrity("restart, nothing new")
         self.assertEqual(after["bronze"]["snapshots"], before["bronze"]["snapshots"])
+        self.assertEqual(after["silver"]["snapshots"], before["silver"]["snapshots"])
         self.assertEqual(helper("batches", BRONZE_CKPT), bronze_batches)
+        self.assertEqual(helper("batches", f"{CKPT}/silver_status"), silver_batches)
 
     def test_5_minio_lost_in_the_middle_of_a_run(self):
         self.produce(polls=10, stations=1000, tag="minio-outage")   # 10 000 messages
@@ -333,23 +389,29 @@ class SparkRecoveryTest(unittest.TestCase):
         (script, *args), env = bronze_job({"MAX_OFFSETS_PER_TRIGGER": "2000"})
         process = subprocess.Popen(spark_cmd(script, *args, env=env), text=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        lines, paused_at = [], None
+        output, paused_at = Output(process), None
         try:
-            for line in process.stdout:
-                lines.append(line)
-                if line.startswith("[progress] gbfs_status_bronze"):
-                    compose("pause", "minio")       # after the first committed batch
-                    paused_at = time.monotonic()
-                    break
-            try:
-                lines.append(process.communicate(timeout=300)[0])
-                outcome = f"exit {process.returncode} {time.monotonic() - paused_at:.0f}s after the pause"
-            except subprocess.TimeoutExpired:
-                kill_driver()
-                lines.append(process.communicate()[0])
-                outcome = "still retrying 300s after the pause, killed"
+            started = output.until(lambda l: l.startswith("[progress] gbfs_status_bronze"), 600)
+            if started:
+                compose("pause", "minio")       # after the first committed batch
+                paused_at = time.monotonic()
+                ended = output.until(lambda l: False, 300)
+                if ended is None:
+                    kill_driver()
+                    output.until(lambda l: False, 120)
+                    outcome = "still retrying 300s after the pause, killed"
+                else:
+                    outcome = f"ended {time.monotonic() - paused_at:.0f}s after the pause"
+            else:
+                process.kill()
+                output.until(lambda l: False, 120)
+                outcome = "no batch committed before the run ended"
+            process.wait(timeout=120)
+            if started:
+                outcome = f"exit {process.returncode}, {outcome}"
         finally:
             compose("unpause", "minio")
+        lines = output.lines
         path = save_log("t5-bronze-minio-paused", "".join(lines))
         errors = [l.strip() for l in "".join(lines).splitlines()
                   if ("Exception" in l or "Error" in l) and not l.strip().startswith("at ")][:2]
@@ -393,6 +455,30 @@ class SparkRecoveryTest(unittest.TestCase):
         run_ok("t6-bronze-c", bronze_job())
         run_ok("t6-silver-c", silver_job(REBUILD_CKPT))
         self.assert_integrity("new checkpoint continues")
+
+    def test_7_replay_after_the_commit_snapshot_was_expired(self):
+        self.produce(polls=2, stations=50, tag="expired-replay")
+        run_ok("t7-bronze", bronze_job())
+        before = self.assert_integrity("before", silver=False)
+
+        batches = helper("batches", BRONZE_CKPT)
+        last = batches["commits"][-1]
+        self.assertTrue(helper("rm", f"{BRONZE_CKPT}/commits/{last}")["deleted"])
+        self.assertEqual(uncommitted(BRONZE_CKPT), [last])
+        # Another commit becomes current (compaction: same rows, new files), then
+        # every older snapshot is expired, including the one batch `last` made.
+        compacted = helper("compact", BRONZE)
+        expired = helper("expire", BRONZE)
+        log(f"batch {last} uncommitted in the checkpoint; compacted {compacted}, "
+            f"expired {expired}")
+        self.assertEqual(expired["snapshots"], 1)
+
+        out = run_ok("t7-bronze-replay", bronze_job())
+        self.assertEqual(uncommitted(BRONZE_CKPT), [])
+        self.assertIn("already in Bronze, skipped", out)
+        after = self.assert_integrity("replay after expiry", silver=False)
+        self.assertEqual(after["bronze"]["rows"], before["bronze"]["rows"])
+        self.assertEqual(after["bronze"]["snapshots"], 1)   # nothing appended
 
 
 if __name__ == "__main__":

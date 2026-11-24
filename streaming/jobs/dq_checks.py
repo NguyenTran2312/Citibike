@@ -9,7 +9,9 @@ fails, so an orchestrator stops the steps after it.
 
 The Silver reconciliation checks compare Silver with the Bronze keys that pass
 validation *today* (raw_value re-validated with the same code Silver uses, not the
-dq_is_valid flag stored at ingest time). Run them on a quiet Bronze: stop the
+dq_is_valid flag stored at ingest time). Messages whose poll_id Silver recorded with
+another collected_at (<silver table>_polls) are left out of Silver on purpose; a
+warn check counts them. Run them on a quiet Bronze: stop the
 spark-streaming service (or wait for its Silver queries to catch up) and run
 silver_*.py --available-now first; otherwise rows Bronze committed after Silver's
 last batch show up as "missing".
@@ -54,13 +56,16 @@ def _bronze_checks(prefix: str, b: str) -> List[Check]:
 
 
 VALID_KEYS_VIEW = "dq_valid_bronze_keys"
+CONFLICT_VIEW = "dq_poll_time_conflicts"
 
 
 def _silver_key_checks(prefix: str, b: str, s: str) -> List[Check]:
     """Grain and reconciliation with Bronze, shared by both Silver tables.
-    VALID_KEYS_VIEW is created by run() from the Bronze table `b`."""
+    VALID_KEYS_VIEW and CONFLICT_VIEW are created by run() from the Bronze table `b`."""
     valid_keys = VALID_KEYS_VIEW
     return [
+        # Valid messages that contradict their poll's collected_at (not in Silver).
+        (f"{prefix}_poll_time_conflicts", "warn", f"SELECT count(*) FROM {CONFLICT_VIEW}"),
         (f"{prefix}_grain_unique", "error", f"""
             SELECT count(*) FROM (
               SELECT station_id, poll_id FROM {s} GROUP BY 1, 2 HAVING count(*) > 1)"""),
@@ -117,17 +122,33 @@ def checks(layer: str, bronze: str, silver: str) -> List[Check]:
     raise ValueError(f"unknown layer {layer}")
 
 
-def create_valid_keys_view(spark: SparkSession, layer: str, bronze: str) -> None:
-    """Bronze keys that pass validation now: the same code path Silver uses."""
+def create_valid_keys_view(spark: SparkSession, layer: str, bronze: str, polls: str) -> None:
+    """Bronze keys that pass validation now (the same code path Silver uses), minus
+    the messages whose poll Silver recorded with another collected_at."""
+    from pyspark.sql import functions as F
+    from pyspark.sql.utils import AnalysisException
     from streaming.jobs.silver import valid_messages
     feed = layer.split("_", 1)[1]
-    (valid_messages(spark.table(bronze), feed).select("station_id", "poll_id").distinct()
+    valid = (valid_messages(spark.table(bronze), feed)
+             .select("station_id", "poll_id", F.to_timestamp("collected_at").alias("at")))
+    try:
+        known = spark.table(polls).select("poll_id", F.col("collected_at").alias("poll_at"))
+        valid = valid.join(known, "poll_id", "left")
+    except AnalysisException:  # Silver never ran: no poll recorded yet
+        valid = valid.withColumn("poll_at", F.lit(None).cast("timestamp"))
+    valid = valid.cache()
+    conflict = F.col("poll_at").isNotNull() & (F.col("at") != F.col("poll_at"))
+    valid.filter(conflict).createOrReplaceTempView(CONFLICT_VIEW)
+    (valid.filter(~conflict).select("station_id", "poll_id").distinct()
      .createOrReplaceTempView(VALID_KEYS_VIEW))
 
 
-def run(spark: SparkSession, layer: str, bronze: str, silver: str) -> bool:
+def run(spark: SparkSession, layer: str, bronze: str, silver: str,
+        polls: str | None = None) -> bool:
+    """`polls`: the Silver table's poll table, default <silver>_polls."""
     if layer.startswith("silver_"):
-        create_valid_keys_view(spark, layer, bronze)
+        from streaming.jobs.silver import polls_table
+        create_valid_keys_view(spark, layer, bronze, polls or polls_table(silver))
     ok = True
     for name, severity, sql in checks(layer, bronze, silver):
         bad = spark.sql(sql).collect()[0][0]
