@@ -133,14 +133,6 @@ head -n 1 "$FIXTURES/station_status.jsonl" \
 bronze_then_silver run5
 expect_silver "run 5 (same key, collected_at one minute later)" "abc/$P1 abc/poll-2 def/$P1 def/poll-3"
 
-# Run 5b (review finding): the poll-2 message again, collected_at two days later.
-# Silver recorded poll-2 at 02:40, so this message stays in Bronze only.
-head -n 1 "$FIXTURES/station_status.jsonl" \
-  | sed "s/$P1/poll-2/; s/2026-11-16T02:40:00Z/2026-11-18T02:40:00Z/" | produce
-bronze_then_silver run5b
-expect_silver "run 5b (same key, collected_at two days later)" "abc/$P1 abc/poll-2 def/$P1 def/poll-3"
-expect_dq "run 5b data-quality gate (conflict is a warning)" 0
-
 # Run 6 (review finding): Silver checkpoint lost again and Bronze replayed with a
 # non-UTC Spark session time zone -> no new rows.
 must rm-silver6.log /opt/project/tests/integration/str09_silver_check.py "$CKPT/silver_status" rm

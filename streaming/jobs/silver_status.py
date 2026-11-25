@@ -62,10 +62,9 @@ SILVER_STATUS_COLUMNS = [
 ]
 
 
-def silver_status_candidates(bronze: DataFrame) -> DataFrame:
-    """Bronze rows -> every valid message, typed, NOT deduplicated (no I/O). The
-    streaming MERGE checks the poll's collected_at before deduplicating."""
-    return valid_messages(bronze, "status").select(
+def silver_status_rows(bronze: DataFrame) -> DataFrame:
+    """Bronze rows -> valid, typed, deduplicated Silver rows (no I/O)."""
+    return first_per_key(valid_messages(bronze, "status")).select(
         "station_id",
         "poll_id",
         F.to_timestamp("collected_at").alias("collected_at"),
@@ -85,16 +84,11 @@ def silver_status_candidates(bronze: DataFrame) -> DataFrame:
     )
 
 
-def silver_status_rows(bronze: DataFrame) -> DataFrame:
-    """Bronze rows -> valid, typed, one row per (station_id, poll_id) (no I/O)."""
-    return first_per_key(silver_status_candidates(bronze))
-
-
 def start_silver_status_query(spark: SparkSession, checkpoint: str | None = None,
                               available_now: bool = False,
                               from_timestamp_ms: int | None = None):
     return start_silver_query(spark, "status", SILVER_STATUS_TABLE, SILVER_STATUS_DDL,
-                              silver_status_candidates, checkpoint or SILVER_STATUS_CHECKPOINT,
+                              silver_status_rows, checkpoint or SILVER_STATUS_CHECKPOINT,
                               available_now, from_timestamp_ms)
 
 
@@ -119,7 +113,7 @@ def main() -> int:
         if not checkpoint:
             raise SystemExit("--rebuild needs a new checkpoint (--checkpoint-dir or "
                              "SILVER_STATUS_CHECKPOINT_LOCATION)")
-        from_ms = rebuild(spark, "status", SILVER_STATUS_TABLE, SILVER_STATUS_DDL, silver_status_candidates, checkpoint)
+        from_ms = rebuild(spark, "status", SILVER_STATUS_TABLE, SILVER_STATUS_DDL, silver_status_rows, checkpoint)
     query = start_silver_status_query(spark, checkpoint, args.available_now, from_ms)
     print(f"started silver: {BRONZE_TABLES['status']} -> {SILVER_STATUS_TABLE}", flush=True)
     query.awaitTermination()

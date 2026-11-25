@@ -41,7 +41,6 @@ Environment (names match docker-compose.yml):
 from __future__ import annotations  # apache/spark:3.5.6 ships Python 3.8
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -50,21 +49,7 @@ from typing import Callable, Dict, List, NamedTuple, Tuple
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQueryListener
-from pyspark.sql.types import (
-    ArrayType,
-    BooleanType,
-    ByteType,
-    DataType,
-    DecimalType,
-    DoubleType,
-    FloatType,
-    IntegerType,
-    LongType,
-    ShortType,
-    StringType,
-    StructField,
-    StructType,
-)
+from pyspark.sql.types import StringType, StructField, StructType
 
 from streaming.utils.schemas import (
     INVALID_SCHEMA,
@@ -188,125 +173,17 @@ def invalid_rules() -> List[Rule]:
     )
 
 
-# --- JSON types (Python, not from_json) -------------------------------------------
-# from_json converts instead of rejecting: 123 or {} become "123" / "{}" in a STRING
-# field, and it accepts single-quoted JSON. The producer (Pydantic, strict) never
-# sends either, so a message whose JSON tokens do not have the schema's types is a
-# SCHEMA_ERROR. Checked with json.loads on raw_value, field by field (nested structs
-# and arrays included); a key that appears twice in one object is rejected too,
-# because from_json would silently keep one of the values.
-TypeSpec = Tuple[str, object]  # (json kind, struct fields | array element | None)
-
-
-def type_spec(dtype: DataType) -> TypeSpec:
-    """Spark type -> plain data the Python workers can check against."""
-    if isinstance(dtype, StructType):
-        return ("object", {f.name: type_spec(f.dataType) for f in dtype.fields})
-    if isinstance(dtype, ArrayType):
-        return ("array", type_spec(dtype.elementType))
-    if isinstance(dtype, StringType):
-        return ("string", None)
-    if isinstance(dtype, BooleanType):
-        return ("boolean", None)
-    if isinstance(dtype, (ByteType, ShortType, IntegerType, LongType)):
-        return ("integer", None)
-    if isinstance(dtype, (FloatType, DoubleType, DecimalType)):
-        return ("number", None)
-    raise TypeError(f"no JSON type check for {dtype}")
-
-
-class _DuplicateKey(ValueError):
-    pass
-
-
-def _reject_constant(name: str):
-    raise ValueError(f"{name} is not JSON")   # json.loads accepts NaN / Infinity
-
-
-def _no_duplicate_keys(pairs):
-    obj = {}
-    for key, value in pairs:
-        if key in obj:
-            raise _DuplicateKey(key)
-        obj[key] = value
-    return obj
-
-
-_KIND_CHECKS = {
-    "string": lambda v: isinstance(v, str),
-    "boolean": lambda v: isinstance(v, bool),
-    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
-    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
-    "object": lambda v: isinstance(v, dict),
-    "array": lambda v: isinstance(v, list),
-}
-
-
-def json_type_errors(raw: str | None, spec: TypeSpec, any_fields: Tuple[str, ...] = ()) -> List[str]:
-    """Fields of the JSON object `raw` whose value has another JSON type than `spec`.
-
-    null is accepted everywhere (required fields are checked by the rules), unknown
-    fields are ignored (from_json ignores them too). Empty or non-JSON text and
-    non-objects return [] because validate() reports them as PARSE / SCHEMA errors;
-    text that Spark parsed but json.loads does not (single quotes, NaN, Infinity) is
-    reported, and so is nesting deeper than json.loads can follow: an exception
-    leaving this function would fail the whole micro-batch, not just the message.
-    """
-    if raw is None or not raw.strip():
-        return []
-    try:
-        doc = json.loads(raw, object_pairs_hook=_no_duplicate_keys,
-                         parse_constant=_reject_constant)
-    except _DuplicateKey as exc:
-        return [f"duplicate key {exc.args[0]}"]
-    except RecursionError:
-        return ["JSON nested too deep"]
-    except ValueError:
-        return ["payload is not strict JSON"]
-    if not isinstance(doc, dict):
-        return []
-    errors: List[str] = []
-
-    def check(value, node: TypeSpec, path: str) -> None:
-        if value is None:
-            return
-        kind, inner = node
-        if not _KIND_CHECKS[kind](value):
-            errors.append(f"{path} must be a JSON {kind}")
-        elif kind == "object":
-            for name, sub in inner.items():
-                if name in value:
-                    check(value[name], sub, f"{path}.{name}")
-        elif kind == "array":
-            for i, item in enumerate(value):
-                check(item, inner, f"{path}[{i}]")
-
-    for name, sub in spec[1].items():
-        if name in doc and name not in any_fields:
-            check(doc[name], sub, name)
-    return errors
-
-
 class Feed(NamedTuple):
     topic: str
     schema: StructType
     rules: Callable[[], List[Rule]]
-    any_fields: Tuple[str, ...] = ()   # fields whose JSON value may be of any type
-
-
-def json_type_errors_column(feed: str) -> Column:
-    """array<string> of json_type_errors() for raw_value (Python UDF)."""
-    spec = type_spec(FEEDS[feed].schema)
-    any_fields = FEEDS[feed].any_fields
-    check = F.udf(lambda raw: json_type_errors(raw, spec, any_fields), ArrayType(StringType()))
-    return check(F.col("raw_value"))
 
 
 FEEDS: Dict[str, Feed] = {
     "status": Feed(STATUS_TOPIC, STATION_STATUS_SCHEMA, status_rules),
     "information": Feed(INFORMATION_TOPIC, STATION_INFORMATION_SCHEMA, information_rules),
     # Not streamed by this job (the producer writes it); kept for the fixture/contract check.
-    "invalid": Feed(TOPIC_INVALID, INVALID_SCHEMA, invalid_rules, any_fields=("raw_payload",)),
+    "invalid": Feed(TOPIC_INVALID, INVALID_SCHEMA, invalid_rules),
 }
 STREAM_FEEDS = ["status", "information"]
 
@@ -380,12 +257,10 @@ def validate(parsed: DataFrame, feed: str) -> DataFrame:
         F.array(*[F.when(cond, F.lit(msg)) for cond, msg in FEEDS[feed].rules()]),
         lambda m: m.isNotNull(),
     )
-    type_errors = F.col("_json_type_errors")
     error_type = (
         F.when(empty, F.lit(PARSE_ERROR))
         .when(corrupt.isNotNull() & ~is_json, F.lit(PARSE_ERROR))
         .when(corrupt.isNotNull(), F.lit(SCHEMA_ERROR))
-        .when(F.size(type_errors) > 0, F.lit(SCHEMA_ERROR))
         .when(F.size(errors) > 0, F.lit(VALIDATION_ERROR))
     )
     error_message = (
@@ -393,16 +268,12 @@ def validate(parsed: DataFrame, feed: str) -> DataFrame:
         .when(corrupt.isNotNull() & ~is_json, F.lit("payload is not valid JSON"))
         .when(corrupt.isNotNull(),
               F.lit("JSON does not match schema (not an object or a field has the wrong type)"))
-        .when(F.size(type_errors) > 0,
-              F.concat(F.lit("JSON does not match schema: "), F.array_join(type_errors, "; ")))
         .when(F.size(errors) > 0, F.array_join(errors, "; "))
     )
     return (parsed
-            .withColumn("_json_type_errors", json_type_errors_column(feed))
             .withColumn("dq_error_type", error_type)
             .withColumn("dq_error_message", error_message)
-            .withColumn("dq_is_valid", F.col("dq_error_type").isNull())
-            .drop("_json_type_errors"))
+            .withColumn("dq_is_valid", F.col("dq_error_type").isNull()))
 
 
 def valid_rows(validated: DataFrame, feed: str) -> DataFrame:

@@ -89,9 +89,8 @@ def main() -> None:
         emit({"rewritten": row["rewritten_data_files_count"],
               "snapshots": snapshots(spark, args[0])})
     elif action == "drop":
-        for table in args:   # a Silver table's poll table goes with it
-            for name in (table, f"{table}_polls"):
-                spark.sql(f"DROP TABLE IF EXISTS {name} PURGE")
+        for table in args:
+            spark.sql(f"DROP TABLE IF EXISTS {table} PURGE")
     else:
         raise SystemExit(f"unknown action {action}")
 

@@ -24,8 +24,7 @@ PRODUCER_SCHEMAS = REPO / "ingestion" / "gbfs" / "json_schemas"
 if SparkSession is not None:
     from streaming.jobs.gbfs_history import (
         BRONZE_COLUMNS, PARSE_ERROR, SCHEMA_ERROR, VALIDATION_ERROR,
-        bronze_rows, invalid_rows, json_type_errors, parse_value, type_spec, valid_rows,
-        validate)
+        bronze_rows, invalid_rows, parse_value, valid_rows, validate)
     from streaming.utils.schemas import (
         INVALID_SCHEMA, STATION_INFORMATION_SCHEMA, STATION_STATUS_SCHEMA)
 
@@ -214,91 +213,6 @@ class ParseValidateTest(unittest.TestCase):
         row = self._one(_valid_status(station_id=None, num_docks_available=-3))
         self.assertEqual(row.dq_error_message, "missing station_id; negative num_docks_available")
 
-    def test_wrong_typed_identifiers_are_rejected(self):
-        # from_json would turn 123 into "123" and {} into "{}" for a STRING field.
-        cases = [
-            (_valid_status(station_id=123), "status", "station_id must be a JSON string"),
-            (_valid_status(poll_id={}), "status", "poll_id must be a JSON string"),
-            (_valid_status(collected_at=1794796740), "status", "collected_at must be a JSON string"),
-            (_valid_information(name=5), "information", "name must be a JSON string"),
-            (_valid_information(region_id=71), "information", "region_id must be a JSON string"),
-        ]
-        for msg, feed, text in cases:
-            with self.subTest(msg=msg):
-                schema = STATION_STATUS_SCHEMA if feed == "status" else STATION_INFORMATION_SCHEMA
-                row = self._one(msg, feed, schema)
-                self.assertFalse(row.dq_is_valid)
-                self.assertIn(text, row.dq_error_message)
-
-    def test_wrong_types_are_schema_errors(self):
-        row = self._one(_valid_status(station_id=123))
-        self.assertEqual(row.dq_error_type, SCHEMA_ERROR)
-        self.assertEqual(row.dq_error_message,
-                         "JSON does not match schema: station_id must be a JSON string")
-
-    def test_nested_key_with_the_same_name_does_not_hide_a_wrong_type(self):
-        # Codex review: the regex found "station_id":"decoy" inside "extra".
-        msg = _valid_status(station_id=123, extra={"station_id": "decoy"})
-        row = self._one(msg)
-        self.assertFalse(row.dq_is_valid)
-        self.assertIn("station_id must be a JSON string", row.dq_error_message)
-
-    def test_duplicate_keys_are_rejected(self):
-        rest = _valid_status()
-        del rest["station_id"]
-        for keys in ('"station_id": "abc", "station_id": 123',
-                     '"station_id": 123, "station_id": "abc"'):
-            line = "{" + keys + ", " + json.dumps(rest)[1:]
-            with self.subTest(line=line):
-                row = self._one(line)
-                self.assertFalse(row.dq_is_valid)
-                self.assertEqual(row.dq_error_type, SCHEMA_ERROR)
-                self.assertIn("duplicate key station_id", row.dq_error_message)
-
-    def test_unicode_escaped_key_is_the_same_key(self):
-        line = json.dumps(_valid_status()).replace('"station_id"', '"station\\u005fid"')
-        self.assertIn("\\u005f", line)
-        self.assertTrue(self._one(line).dq_is_valid)
-
-    def test_nested_strings_are_type_checked(self):
-        status = _valid_status(vehicle_types_available=[{"vehicle_type_id": 1, "count": 2}])
-        row = self._one(status)
-        self.assertEqual(row.dq_error_type, SCHEMA_ERROR)
-        self.assertIn("vehicle_types_available[0].vehicle_type_id must be a JSON string",
-                      row.dq_error_message)
-        info = _valid_information(rental_uris={"android": 5})
-        row = self._one(info, "information", STATION_INFORMATION_SCHEMA)
-        self.assertEqual(row.dq_error_type, SCHEMA_ERROR)
-        self.assertIn("rental_uris.android must be a JSON string", row.dq_error_message)
-
-    def test_single_quoted_json_is_rejected(self):
-        line = json.dumps(_valid_status()).replace('"', "'")
-        row = self._one(line)
-        self.assertFalse(row.dq_is_valid)
-        self.assertIn("not strict JSON", row.dq_error_message)
-
-    def test_deeply_nested_message_fails_alone_not_the_batch(self):
-        # Codex review 3: RecursionError escaped the Python UDF and failed the batch.
-        deep = _valid_status(station_id="deep")
-        line = json.dumps(deep)[:-1] + ', "extra": ' + "[" * 1200 + "]" * 1200 + "}"
-        validated = self._validate([json.dumps(_valid_status(station_id="a")), line,
-                                    json.dumps(_valid_status(station_id="b"))],
-                                   "status", STATION_STATUS_SCHEMA)
-        rows = bronze_rows(validated).collect()          # every message reaches Bronze
-        self.assertEqual(len(rows), 3)
-        deep_rows = [r for r in rows if "[[[[" in r.raw_value]
-        self.assertEqual(len(deep_rows), 1)
-        self.assertFalse(deep_rows[0].dq_is_valid)
-        self.assertEqual(sorted(r.station_id for r in rows if r.dq_is_valid), ["a", "b"])
-
-    def test_nan_and_infinity_are_rejected(self):
-        for constant in ("NaN", "Infinity", "-Infinity"):
-            with self.subTest(constant=constant):
-                line = json.dumps(_valid_status())[:-1] + f', "extra": {constant}}}'
-                row = self._one(line)
-                self.assertFalse(row.dq_is_valid)
-                self.assertIn("not strict JSON", row.dq_error_message)
-
     def test_escaped_quotes_in_values_are_accepted(self):
         info = _valid_information(name='Station "A"')
         self.assertTrue(self._one(info, "information", STATION_INFORMATION_SCHEMA).dq_is_valid)
@@ -436,56 +350,6 @@ class ParseValidateTest(unittest.TestCase):
                                           STATION_STATUS_SCHEMA))
         self.assertEqual(rows.schema["kafka_offset"].dataType.simpleString(), "bigint")
         self.assertTrue(all(r.kafka_offset is None for r in rows.collect()))
-
-
-@unittest.skipIf(SparkSession is None, "pyspark not installed")
-class JsonTypeErrorsTest(unittest.TestCase):
-    """json_type_errors() is plain Python: no Spark session needed."""
-
-    def setUp(self):
-        self.spec = type_spec(STATION_STATUS_SCHEMA)
-
-    def errors(self, doc):
-        return json_type_errors(doc if isinstance(doc, str) else json.dumps(doc), self.spec)
-
-    def test_valid_message_has_no_errors(self):
-        self.assertEqual(self.errors(_valid_status()), [])
-
-    def test_kinds(self):
-        cases = {
-            "num_bikes_available": ("5", "num_bikes_available must be a JSON integer"),
-            "is_renting": (1, "is_renting must be a JSON boolean"),
-            "vehicle_types_available": ({}, "vehicle_types_available must be a JSON array"),
-            "last_reported": (True, "last_reported must be a JSON integer"),
-        }
-        for field, (value, message) in cases.items():
-            with self.subTest(field=field):
-                self.assertEqual(self.errors(_valid_status(**{field: value})), [message])
-
-    def test_numbers_accept_integers_for_doubles(self):
-        spec = type_spec(STATION_INFORMATION_SCHEMA)
-        self.assertEqual(json_type_errors(json.dumps(_valid_information(lat=40)), spec), [])
-
-    def test_nulls_and_unknown_fields_are_left_to_the_rules(self):
-        self.assertEqual(self.errors(_valid_status(station_id=None, extra={"x": 1})), [])
-
-    def test_non_objects_and_empty_text_are_left_to_parse_value(self):
-        for raw in ("", "   ", "[1, 2]", "5"):
-            with self.subTest(raw=raw):
-                self.assertEqual(self.errors(raw), [])
-
-    def test_too_deep_is_an_error_not_an_exception(self):
-        deep = '{"extra": ' + "[" * 100000 + "]" * 100000 + "}"
-        self.assertEqual(self.errors(deep), ["JSON nested too deep"])
-
-    def test_nan_is_not_strict_json(self):
-        self.assertEqual(self.errors('{"extra": NaN}'), ["payload is not strict JSON"])
-
-    def test_any_fields_are_not_checked(self):
-        spec = type_spec(INVALID_SCHEMA)
-        doc = json.dumps({"source": "s", "raw_payload": {"a": 1}})
-        self.assertEqual(json_type_errors(doc, spec), ["raw_payload must be a JSON string"])
-        self.assertEqual(json_type_errors(doc, spec, ("raw_payload",)), [])
 
 
 if __name__ == "__main__":

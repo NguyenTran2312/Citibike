@@ -2,8 +2,6 @@
 
 Runs on a local SparkSession without Iceberg (see tests/README.md for the command).
 """
-import contextlib
-import io
 import json
 import os
 import tempfile
@@ -22,10 +20,7 @@ FIXTURES = Path(__file__).resolve().parents[2] / "streaming" / "fixtures" / "gbf
 if SparkSession is not None:
     from streaming.jobs import dq_checks
     from streaming.jobs.gbfs_history import bronze_rows, parse_value, validate
-    from streaming.jobs.silver import (merge_candidates, polls_with_several_times,
-                                       split_by_poll_time)
-    from streaming.jobs.silver_status import (SILVER_STATUS_COLUMNS, silver_status_candidates,
-                                              silver_status_rows)
+    from streaming.jobs.silver_status import SILVER_STATUS_COLUMNS, silver_status_rows
     from streaming.utils.schemas import STATION_STATUS_SCHEMA
 
 
@@ -34,9 +29,6 @@ def status(**overrides):
     msg = json.loads(line)
     msg.update(overrides)
     return msg
-
-
-POLL = status()["poll_id"]
 
 
 @unittest.skipIf(SparkSession is None, "pyspark not installed")
@@ -162,109 +154,14 @@ class SilverStatusTest(unittest.TestCase):
         rows = self.silver([status(last_reported=1794787200000000), status(poll_id="p2")])
         self.assertEqual([r.poll_id for r in rows.collect()], ["p2"])
 
-    # --- one collected_at per poll (Codex review: MERGE window) ----------------------
-    def polls(self, *known):
-        """Temp view standing in for <silver>_polls."""
-        df = self.spark.createDataFrame(
-            [(p, datetime.fromisoformat(t.replace("Z", "+00:00"))) for p, t in known],
-            "poll_id string, collected_at timestamp")
-        df.createOrReplaceTempView("test_polls")
-        return "test_polls"
-
-    def split(self, messages, *known):
-        accepted, new_polls, dropped = split_by_poll_time(self.silver(messages),
-                                                          self.polls(*known))
-        return (sorted((r.station_id, r.collected_at.isoformat()) for r in accepted.collect()),
-                sorted((r.poll_id, r.collected_at.isoformat()) for r in new_polls.collect()),
-                dropped)
-
-    def test_new_poll_takes_the_time_of_its_first_message(self):
-        accepted, new_polls, dropped = self.split([
-            status(station_id="a", collected_at="2026-11-16T02:40:00Z"),
-            status(station_id="b", collected_at="2026-11-18T02:40:00Z"),   # 2 days later
-        ])
-        self.assertEqual(accepted, [("a", "2026-11-16T02:40:00")])
-        self.assertEqual(new_polls, [(POLL, "2026-11-16T02:40:00")])
-        self.assertEqual(dropped, 1)
-
-    def test_known_poll_keeps_its_recorded_time(self):
-        # Same key two days away from the recorded poll: dropped, so Silver keeps one row.
-        accepted, new_polls, dropped = self.split(
-            [status(collected_at="2026-11-18T02:40:00Z"), status(station_id="b")],
-            (POLL, "2026-11-16T02:40:00Z"))
-        self.assertEqual(accepted, [("b", "2026-11-16T02:40:00")])
-        self.assertEqual(new_polls, [])
-        self.assertEqual(dropped, 1)
-
-    def test_poll_time_is_checked_before_deduplication(self):
-        # Codex review 3: (B, P, T2) at a lower offset than (B, P, T1) with P known at
-        # T1. Deduplicating first kept T2, then dropped it: B disappeared.
-        candidates = silver_status_candidates(self.bronze([
-            status(station_id="b", collected_at="2026-11-18T02:40:00Z"),   # offset 0
-            status(station_id="b"),                                        # offset 1, T1
-        ]))
-        accepted, new_polls, dropped = merge_candidates(
-            candidates, self.polls((POLL, "2026-11-16T02:40:00Z")))
-        rows = accepted.collect()
-        self.assertEqual([(r.station_id, r.collected_at.isoformat(), r.kafka_offset)
-                          for r in rows], [("b", "2026-11-16T02:40:00", 1)])
-        self.assertEqual(dropped, 1)
-        self.assertEqual(new_polls.count(), 0)
-
-    def test_merge_candidates_still_deduplicate_replays(self):
-        candidates = silver_status_candidates(self.bronze([status(), status(), status()]))
-        accepted, new_polls, dropped = merge_candidates(candidates, self.polls())
-        self.assertEqual([r.kafka_offset for r in accepted.collect()], [0])
-        self.assertEqual((new_polls.count(), dropped), (1, 0))
-
-    def test_polls_with_several_times_are_found(self):
-        silver = silver_status_rows(self.bronze([
-            status(station_id="a"), status(station_id="b", collected_at="2026-11-18T02:40:00Z"),
-            status(station_id="a", poll_id="p2")]))
-        self.assertEqual([r.poll_id for r in polls_with_several_times(silver).collect()], [POLL])
-
-    def test_dq_fails_when_a_poll_has_several_times(self):
-        bronze = self.bronze([status(station_id="a"),
-                              status(station_id="b", collected_at="2026-11-18T02:40:00Z")])
-        bronze.createOrReplaceTempView("dq_bronze")
-        silver_status_rows(bronze).createOrReplaceTempView("dq_silver")
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            ok = dq_checks.run(self.spark, "silver_status", "dq_bronze", "dq_silver",
-                               self.polls())
-        self.assertFalse(ok)
-        self.assertIn("[FAIL] silver_status_one_collected_at_per_poll: 1 bad rows",
-                      out.getvalue())
-
-    def test_bronze_dq_uses_the_sink_message_identity(self):
+    def test_bronze_dq_fails_on_a_duplicated_message(self):
         bronze = self.bronze([status()])
-        recreated = bronze.withColumn("kafka_timestamp",
-                                      F.col("kafka_timestamp") + F.expr("INTERVAL 1 DAY"))
-        for name, table, expect_ok, line in (
-                ("recreated topic", bronze.unionByName(recreated), True,
-                 "[WARN] bronze_status_offset_reused: 1 bad rows"),
-                ("duplicate message", bronze.unionByName(bronze), False,
-                 "[FAIL] bronze_status_no_duplicate_messages: 1 bad rows")):
-            with self.subTest(name):
-                table.createOrReplaceTempView("dq_bronze")
-                out = io.StringIO()
-                with contextlib.redirect_stdout(out):
-                    ok = dq_checks.run(self.spark, "bronze_status", "dq_bronze", "dq_silver")
-                self.assertEqual(ok, expect_ok, out.getvalue())
-                self.assertIn(line, out.getvalue())
-
-    def test_dq_does_not_count_poll_time_conflicts_as_missing(self):
-        bronze = self.bronze([status(), status(station_id="b",
-                                               collected_at="2026-11-18T02:40:00Z")])
-        silver = silver_status_rows(bronze).filter("station_id = 'abc'")
-        polls = self.polls((POLL, "2026-11-16T02:40:00Z"))
+        bronze.unionByName(bronze).createOrReplaceTempView("dq_bronze")
+        with _quiet():
+            self.assertFalse(dq_checks.run(self.spark, "bronze_status", "dq_bronze", "dq_silver"))
         bronze.createOrReplaceTempView("dq_bronze")
-        silver.createOrReplaceTempView("dq_silver")
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            ok = dq_checks.run(self.spark, "silver_status", "dq_bronze", "dq_silver", polls)
-        self.assertTrue(ok, out.getvalue())
-        self.assertIn("[WARN] silver_status_poll_time_conflicts: 1 bad rows", out.getvalue())
+        with _quiet():
+            self.assertTrue(dq_checks.run(self.spark, "bronze_status", "dq_bronze", "dq_silver"))
 
     def test_dq_fails_on_rows_bronze_did_not_accept(self):
         bronze = self.bronze([status()])

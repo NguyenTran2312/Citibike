@@ -9,13 +9,9 @@ Both Silver tables have grain (station_id, poll_id) and are built the same way:
     stay in Bronze only;
   * keep one row per (station_id, poll_id): a replayed message (producer retry,
     poller --replay) is dropped, the lowest Kafka offset wins;
-  * one collected_at per poll: the side table <silver table>_polls records the
-    collected_at of every poll that reached Silver; a message whose poll_id is
-    known with another collected_at (corrupt producer) stays in Bronze only;
   * MERGE ... ON (station_id, poll_id) WHEN NOT MATCHED THEN INSERT: an
     observation never changes, so a replayed micro-batch or a lost Silver
-    checkpoint adds no duplicate rows. Because a poll has a single collected_at,
-    the MERGE only reads the Silver partitions of the batch's collected_at values.
+    checkpoint adds no duplicate rows.
 
 The Silver checkpoint must be on S3 (MinIO): the Iceberg streaming source writes
 its offsets with the table's S3FileIO. The source needs every Bronze snapshot
@@ -37,23 +33,18 @@ from streaming.jobs.gbfs_history import (
     validate,
 )
 
+# A poll's messages all carry the poll's collected_at (the poller sets it once per
+# poll; --replay keeps it), so an existing row for a key lies within a day of the
+# incoming one. The window only prunes partitions; matching is on (station_id,
+# poll_id) alone. Scope assumption (streaming/README.md "Giả định phạm vi"): only
+# the team's poller writes the gbfs.* topics. A key replayed with a collected_at
+# more than a day away would get a second row, which *_grain_unique reports.
+PRUNE_MARGIN_MICROS = 24 * 3600 * 1_000_000
+
 # rebuild() hands over to the stream this long before the Bronze snapshot it read:
-# Iceberg picks the start snapshot by commit time, and snapshots committed in the
-# same millisecond (or with a slightly wrong clock) must not be skipped. Reading a
+# Iceberg picks the start snapshot by commit time, which is not unique. Reading a
 # few snapshots twice is harmless, the MERGE only inserts new keys.
 REBUILD_HANDOFF_MARGIN_MS = 60_000
-
-POLLS_DDL = """
-CREATE TABLE IF NOT EXISTS {table} (
-    poll_id      STRING    COMMENT 'one row per poll that reached the Silver table',
-    collected_at TIMESTAMP COMMENT 'collected_at of every Silver row of this poll'
-) USING iceberg
-TBLPROPERTIES ('format-version' = '2')
-"""
-
-
-def polls_table(silver_table: str) -> str:
-    return f"{silver_table}_polls"
 
 
 def valid_messages(bronze: DataFrame, feed: str) -> DataFrame:
@@ -77,118 +68,33 @@ def first_per_key(df: DataFrame) -> DataFrame:
     return df.withColumn("_rank", F.row_number().over(first)).filter("_rank = 1").drop("_rank")
 
 
-def polls_with_several_times(silver: DataFrame) -> DataFrame:
-    """poll_id values that have more than one collected_at in a Silver table."""
-    return (silver.groupBy("poll_id").agg(F.countDistinct("collected_at").alias("n"))
-            .filter("n > 1").select("poll_id"))
-
-
-def ensure_polls_table(spark: SparkSession, silver_table: str) -> str:
-    """Create <silver_table>_polls; filled from Silver the first time, so a Silver
-    table built before the poll table existed keeps its guarantee.
-
-    Refuses to fill it when Silver already has a poll with several collected_at
-    (written before this guarantee existed): the MERGE matches on the poll's time,
-    so such rows would let the same key be inserted again.
-    """
-    polls = polls_table(silver_table)
-    spark.sql(POLLS_DDL.format(table=polls))
-    if (_iceberg_table(spark, polls).currentSnapshot() is None
-            and _iceberg_table(spark, silver_table).currentSnapshot() is not None):
-        bad = polls_with_several_times(spark.table(silver_table)).count()
-        if bad:
-            raise SystemExit(
-                f"{silver_table} has {bad} poll_id(s) with several collected_at; keep one "
-                f"collected_at per poll (delete the other rows) before starting. List them: "
-                f"SELECT poll_id, collected_at, count(*) FROM {silver_table} GROUP BY 1, 2 "
-                f"HAVING poll_id IN (SELECT poll_id FROM {silver_table} GROUP BY poll_id "
-                f"HAVING count(DISTINCT collected_at) > 1)")
-        spark.sql(f"INSERT INTO {polls} SELECT poll_id, min(collected_at) "
-                  f"FROM {silver_table} GROUP BY poll_id")
-    return polls
-
-
-def split_by_poll_time(rows: DataFrame, polls: str):
-    """(rows with their poll's collected_at, polls new to Silver, number of rows dropped).
-
-    `rows` are all valid messages, NOT deduplicated yet: deduplicating first could
-    keep a message with the wrong time and drop the right one for the same key.
-
-    A poll's collected_at is the one already recorded in `polls`, or for a new poll
-    the collected_at of its first message (lowest Kafka position). Rows with another
-    collected_at are dropped: they contradict an earlier message of the same poll.
-    """
-    first = Window.partitionBy("poll_id").orderBy("kafka_partition", "kafka_offset")
-    batch_polls = (rows.withColumn("_rank", F.row_number().over(first))
-                   .filter("_rank = 1")
-                   .select("poll_id", F.col("collected_at").alias("_first_at")))
-    known = (rows.sparkSession.table(polls)
-             .join(F.broadcast(batch_polls.select("poll_id")), "poll_id")
-             .select("poll_id", F.col("collected_at").alias("_known_at")))
-    poll_time = (batch_polls.join(known, "poll_id", "left")
-                 .select("poll_id",
-                         F.coalesce("_known_at", "_first_at").alias("_poll_at"),
-                         F.col("_known_at").isNull().alias("_new")))
-    joined = rows.join(F.broadcast(poll_time), "poll_id")
-    accepted = joined.filter(F.col("collected_at") == F.col("_poll_at")).select(*rows.columns)
-    dropped = joined.filter(F.col("collected_at") != F.col("_poll_at")).count()
-    new_polls = poll_time.filter("_new").select("poll_id",
-                                                F.col("_poll_at").alias("collected_at"))
-    return accepted, new_polls, dropped
-
-
-def merge_candidates(rows: DataFrame, polls: str):
-    """Valid messages -> (one row per key with the poll's collected_at, new polls,
-    rows dropped for a wrong collected_at): poll time first, then deduplication."""
-    accepted, new_polls, dropped = split_by_poll_time(rows, polls)
-    return first_per_key(accepted), new_polls, dropped
-
-
 def merge_new_keys(rows: DataFrame, table: str, view: str) -> int:
     """Insert the (station_id, poll_id) keys `table` does not have yet; returns the
-    number of candidate rows. `rows`: typed valid messages, not deduplicated (the
-    *_candidates functions). ensure_polls_table(table) must have run."""
-    spark = rows.sparkSession
-    polls = polls_table(table)
+    number of candidate rows."""
     rows = rows.cache()
-    accepted = new_polls = None
     try:
-        accepted, new_polls, dropped = merge_candidates(rows, polls)
-        accepted, new_polls = accepted.cache(), new_polls.cache()
         # Epoch microseconds, not datetime literals: independent of the driver's
         # and the session's time zone.
-        bounds = accepted.agg(F.count(F.lit(1)).alias("n"),
-                              F.min(F.unix_micros("collected_at")).alias("lo"),
-                              F.max(F.unix_micros("collected_at")).alias("hi")).first()
-        if dropped:
-            print(f"[silver] {table}: {dropped} rows dropped, their poll_id is known with "
-                  f"another collected_at", flush=True)
+        bounds = rows.agg(F.count(F.lit(1)).alias("n"),
+                          F.min(F.unix_micros("collected_at")).alias("lo"),
+                          F.max(F.unix_micros("collected_at")).alias("hi")).first()
         if not bounds["n"]:
             return 0  # nothing valid in this batch
-        # Record the polls first: a crash before the MERGE leaves polls Silver does
-        # not have yet, which the replayed batch then finds with the same time.
-        if not new_polls.isEmpty():
-            new_polls.writeTo(polls).append()
         print(f"[silver] merge {view} into {table}: {bounds['n']} rows", flush=True)
-        accepted.createOrReplaceTempView(view)
-        # Every Silver row of a poll has the poll's collected_at, so equal keys have
-        # equal collected_at and the range below only prunes partitions.
-        spark.sql(f"""
+        rows.createOrReplaceTempView(view)
+        rows.sparkSession.sql(f"""
             MERGE INTO {table} t
             USING {view} s
             ON  t.station_id = s.station_id
             AND t.poll_id = s.poll_id
-            AND t.collected_at = s.collected_at
-            AND t.collected_at BETWEEN timestamp_micros({bounds["lo"]})
-                                   AND timestamp_micros({bounds["hi"]})
+            AND t.collected_at BETWEEN timestamp_micros({bounds["lo"] - PRUNE_MARGIN_MICROS})
+                                   AND timestamp_micros({bounds["hi"] + PRUNE_MARGIN_MICROS})
             WHEN NOT MATCHED THEN INSERT *
         """)
-        spark.catalog.dropTempView(view)
+        rows.sparkSession.catalog.dropTempView(view)
         return bounds["n"]
     finally:
-        for df in (rows, accepted, new_polls):
-            if df is not None:
-                df.unpersist()
+        rows.unpersist()
 
 
 def _iceberg_table(spark: SparkSession, table: str):
@@ -215,7 +121,6 @@ def start_silver_query(spark: SparkSession, feed: str, table: str, ddl: str,
                          f"SILVER_{feed.upper()}_CHECKPOINT_LOCATION or --checkpoint-dir")
     bronze_table = ensure_bronze_table(spark, feed)
     spark.sql(ddl.format(table=table))
-    ensure_polls_table(spark, table)
 
     def merge_batch(batch: DataFrame, batch_id: int) -> None:
         merge_new_keys(to_silver(batch), table, f"silver_{feed}_batch_{batch_id}")
@@ -250,7 +155,6 @@ def rebuild(spark: SparkSession, feed: str, table: str, ddl: str,
         raise SystemExit(f"rebuild needs a new checkpoint, {new_checkpoint} already exists")
     bronze_table = ensure_bronze_table(spark, feed)
     spark.sql(ddl.format(table=table))
-    ensure_polls_table(spark, table)
     snapshot = _iceberg_table(spark, bronze_table).currentSnapshot()
     if snapshot is None:
         print(f"[silver] rebuild {table}: Bronze is empty", flush=True)
