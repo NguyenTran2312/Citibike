@@ -219,6 +219,10 @@ class _DuplicateKey(ValueError):
     pass
 
 
+def _reject_constant(name: str):
+    raise ValueError(f"{name} is not JSON")   # json.loads accepts NaN / Infinity
+
+
 def _no_duplicate_keys(pairs):
     obj = {}
     for key, value in pairs:
@@ -244,14 +248,19 @@ def json_type_errors(raw: str | None, spec: TypeSpec, any_fields: Tuple[str, ...
     null is accepted everywhere (required fields are checked by the rules), unknown
     fields are ignored (from_json ignores them too). Empty or non-JSON text and
     non-objects return [] because validate() reports them as PARSE / SCHEMA errors;
-    text that Spark parsed but json.loads does not (e.g. single quotes) is reported.
+    text that Spark parsed but json.loads does not (single quotes, NaN, Infinity) is
+    reported, and so is nesting deeper than json.loads can follow: an exception
+    leaving this function would fail the whole micro-batch, not just the message.
     """
     if raw is None or not raw.strip():
         return []
     try:
-        doc = json.loads(raw, object_pairs_hook=_no_duplicate_keys)
+        doc = json.loads(raw, object_pairs_hook=_no_duplicate_keys,
+                         parse_constant=_reject_constant)
     except _DuplicateKey as exc:
         return [f"duplicate key {exc.args[0]}"]
+    except RecursionError:
+        return ["JSON nested too deep"]
     except ValueError:
         return ["payload is not strict JSON"]
     if not isinstance(doc, dict):
@@ -424,7 +433,7 @@ BRONZE_DDL = """
 CREATE TABLE IF NOT EXISTS {table} (
     kafka_topic      STRING    COMMENT 'Kafka topic the message was read from',
     kafka_partition  INT,
-    kafka_offset     BIGINT    COMMENT '(kafka_topic, kafka_partition, kafka_offset) identifies a message',
+    kafka_offset     BIGINT    COMMENT '(kafka_topic, kafka_partition, kafka_offset, kafka_timestamp) identifies a message',
     kafka_timestamp  TIMESTAMP,
     kafka_key        STRING    COMMENT 'producer key = station_id',
     raw_value        STRING    COMMENT 'message value exactly as received',

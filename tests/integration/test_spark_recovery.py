@@ -463,15 +463,22 @@ class SparkRecoveryTest(unittest.TestCase):
 
         batches = helper("batches", BRONZE_CKPT)
         last = batches["commits"][-1]
+        # The run appended this scenario's messages in its last batch, so the current
+        # snapshot is the one batch `last` committed.
+        batch_snapshot = helper("snapshot-ids", BRONZE)["current"]
         self.assertTrue(helper("rm", f"{BRONZE_CKPT}/commits/{last}")["deleted"])
         self.assertEqual(uncommitted(BRONZE_CKPT), [last])
         # Another commit becomes current (compaction: same rows, new files), then
         # every older snapshot is expired, including the one batch `last` made.
         compacted = helper("compact", BRONZE)
         expired = helper("expire", BRONZE)
-        log(f"batch {last} uncommitted in the checkpoint; compacted {compacted}, "
-            f"expired {expired}")
+        snapshot_ids = helper("snapshot-ids", BRONZE)
+        log(f"batch {last} (snapshot {batch_snapshot}) uncommitted in the checkpoint; "
+            f"compacted {compacted}, expired {expired}, left {snapshot_ids}")
+        self.assertGreater(compacted["rewritten"], 0)
         self.assertEqual(expired["snapshots"], 1)
+        self.assertNotEqual(snapshot_ids["current"], batch_snapshot)
+        self.assertNotIn(batch_snapshot, snapshot_ids["ids"])
 
         out = run_ok("t7-bronze-replay", bronze_job())
         self.assertEqual(uncommitted(BRONZE_CKPT), [])

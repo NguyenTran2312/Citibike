@@ -47,7 +47,9 @@ def main() -> None:
         "rows": df.count(),
         "valid": df.filter("dq_is_valid").count(),
         "per_partition": per_partition,
-        "duplicate_offsets": df.groupBy("kafka_topic", "kafka_partition", "kafka_offset")
+        # Same message identity as the Bronze sink and the DQ check.
+        "duplicate_offsets": df.groupBy("kafka_topic", "kafka_partition", "kafka_offset",
+                                        "kafka_timestamp")
         .count().filter("count > 1").count(),
         "null_raw_value": df.filter("raw_value IS NULL").count(),
         "polls": {r.poll_id: {"stations": r.stations, "rows": r.rows} for r in per_poll},

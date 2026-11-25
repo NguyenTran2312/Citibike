@@ -277,6 +277,28 @@ class ParseValidateTest(unittest.TestCase):
         self.assertFalse(row.dq_is_valid)
         self.assertIn("not strict JSON", row.dq_error_message)
 
+    def test_deeply_nested_message_fails_alone_not_the_batch(self):
+        # Codex review 3: RecursionError escaped the Python UDF and failed the batch.
+        deep = _valid_status(station_id="deep")
+        line = json.dumps(deep)[:-1] + ', "extra": ' + "[" * 1200 + "]" * 1200 + "}"
+        validated = self._validate([json.dumps(_valid_status(station_id="a")), line,
+                                    json.dumps(_valid_status(station_id="b"))],
+                                   "status", STATION_STATUS_SCHEMA)
+        rows = bronze_rows(validated).collect()          # every message reaches Bronze
+        self.assertEqual(len(rows), 3)
+        deep_rows = [r for r in rows if "[[[[" in r.raw_value]
+        self.assertEqual(len(deep_rows), 1)
+        self.assertFalse(deep_rows[0].dq_is_valid)
+        self.assertEqual(sorted(r.station_id for r in rows if r.dq_is_valid), ["a", "b"])
+
+    def test_nan_and_infinity_are_rejected(self):
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                line = json.dumps(_valid_status())[:-1] + f', "extra": {constant}}}'
+                row = self._one(line)
+                self.assertFalse(row.dq_is_valid)
+                self.assertIn("not strict JSON", row.dq_error_message)
+
     def test_escaped_quotes_in_values_are_accepted(self):
         info = _valid_information(name='Station "A"')
         self.assertTrue(self._one(info, "information", STATION_INFORMATION_SCHEMA).dq_is_valid)
@@ -451,6 +473,13 @@ class JsonTypeErrorsTest(unittest.TestCase):
         for raw in ("", "   ", "[1, 2]", "5"):
             with self.subTest(raw=raw):
                 self.assertEqual(self.errors(raw), [])
+
+    def test_too_deep_is_an_error_not_an_exception(self):
+        deep = '{"extra": ' + "[" * 100000 + "]" * 100000 + "}"
+        self.assertEqual(self.errors(deep), ["JSON nested too deep"])
+
+    def test_nan_is_not_strict_json(self):
+        self.assertEqual(self.errors('{"extra": NaN}'), ["payload is not strict JSON"])
 
     def test_any_fields_are_not_checked(self):
         spec = type_spec(INVALID_SCHEMA)

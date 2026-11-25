@@ -64,9 +64,10 @@ SILVER_INFORMATION_COLUMNS = [
 ]
 
 
-def silver_information_rows(bronze: DataFrame) -> DataFrame:
-    """Bronze rows -> valid, typed, deduplicated Silver snapshot rows (no I/O)."""
-    return first_per_key(valid_messages(bronze, "information")).select(
+def silver_information_candidates(bronze: DataFrame) -> DataFrame:
+    """Bronze rows -> every valid message, typed, NOT deduplicated (no I/O). The
+    streaming MERGE checks the poll's collected_at before deduplicating."""
+    return valid_messages(bronze, "information").select(
         "station_id",
         "poll_id",
         F.to_timestamp("collected_at").alias("collected_at"),
@@ -87,11 +88,16 @@ def silver_information_rows(bronze: DataFrame) -> DataFrame:
     )
 
 
+def silver_information_rows(bronze: DataFrame) -> DataFrame:
+    """Bronze rows -> valid, typed, one row per (station_id, poll_id) (no I/O)."""
+    return first_per_key(silver_information_candidates(bronze))
+
+
 def start_silver_information_query(spark: SparkSession, checkpoint: str | None = None,
                                    available_now: bool = False,
                                    from_timestamp_ms: int | None = None):
     return start_silver_query(spark, "information", SILVER_INFORMATION_TABLE,
-                              SILVER_INFORMATION_DDL, silver_information_rows,
+                              SILVER_INFORMATION_DDL, silver_information_candidates,
                               checkpoint or SILVER_INFORMATION_CHECKPOINT, available_now,
                               from_timestamp_ms)
 
@@ -118,7 +124,7 @@ def main() -> int:
         if not checkpoint:
             raise SystemExit("--rebuild needs a new checkpoint (--checkpoint-dir or "
                              "SILVER_INFORMATION_CHECKPOINT_LOCATION)")
-        from_ms = rebuild(spark, "information", SILVER_INFORMATION_TABLE, SILVER_INFORMATION_DDL, silver_information_rows, checkpoint)
+        from_ms = rebuild(spark, "information", SILVER_INFORMATION_TABLE, SILVER_INFORMATION_DDL, silver_information_candidates, checkpoint)
     query = start_silver_information_query(spark, checkpoint, args.available_now, from_ms)
     print(f"started silver: {BRONZE_TABLES['information']} -> {SILVER_INFORMATION_TABLE}",
           flush=True)

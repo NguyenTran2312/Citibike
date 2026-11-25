@@ -24,7 +24,7 @@ Schema Spark khớp tên field với JSON Schema của producer (`ingestion/gbfs
 | `SCHEMA_ERROR` | JSON hợp lệ nhưng không phải object, hoặc field sai kiểu JSON (`"five"` cho số, `"true"` cho boolean, `"station_id": 123`, `"poll_id": {}`, `vehicle_types_available[0].vehicle_type_id` là số, `rental_uris.android` là số), một key xuất hiện hai lần trong cùng object, hoặc JSON không chuẩn (dấu nháy đơn) |
 | `VALIDATION_ERROR` | Đúng kiểu nhưng vi phạm contract: thiếu field bắt buộc, chuỗi rỗng, số âm, `schema_version != 1`, datetime thiếu timezone, `lat/lon` ngoài phạm vi, epoch không phải giây (`last_reported` / `last_updated` > 4102444800, tức sau năm 2100)… (liệt kê tất cả lỗi, nối bằng `; `) |
 
-`from_json` của Spark đổi kiểu thay vì từ chối (`123` → `"123"` cho field `STRING`) và chấp nhận dấu nháy đơn, còn producer (Pydantic, strict) thì không. Vì vậy `validate()` kiểm tra thêm kiểu JSON bằng Python (`json_type_errors`, UDF trên `raw_value`): `json.loads` rồi so **từng field theo đúng cấp** với schema Spark, kể cả struct lồng và phần tử mảng; key trùng bị từ chối vì `from_json` âm thầm giữ một trong hai giá trị. Field lạ bị bỏ qua (như `from_json`); `raw_payload` của `gbfs.invalid` nhận mọi kiểu. Giới hạn epoch có ở cả producer (`EpochSeconds`) và Spark: giá trị mili/micro giây làm tràn số khi Silver đổi sang `TIMESTAMP`.
+`from_json` của Spark đổi kiểu thay vì từ chối (`123` → `"123"` cho field `STRING`) và chấp nhận dấu nháy đơn, còn producer (Pydantic, strict) thì không. `NaN`, `Infinity`, `-Infinity` (Python `json.loads` mặc định nhận) cũng bị từ chối; JSON lồng quá sâu (khoảng 1 000 lớp trở lên với Python 3.8 của image) là `SCHEMA_ERROR` "JSON nested too deep", không làm hỏng cả micro-batch. Vì vậy `validate()` kiểm tra thêm kiểu JSON bằng Python (`json_type_errors`, UDF trên `raw_value`): `json.loads` rồi so **từng field theo đúng cấp** với schema Spark, kể cả struct lồng và phần tử mảng; key trùng bị từ chối vì `from_json` âm thầm giữ một trong hai giá trị. Field lạ bị bỏ qua (như `from_json`); `raw_payload` của `gbfs.invalid` nhận mọi kiểu. Giới hạn epoch có ở cả producer (`EpochSeconds`) và Spark: giá trị mili/micro giây làm tràn số khi Silver đổi sang `TIMESTAMP`.
 
 Producer: một trạm có `last_reported` sai đơn vị chỉ làm trạm đó vào `gbfs.invalid`. Nhưng `last_updated` **cấp feed** sai thì cả lần polling hỏng trước khi tách trạm: không có message nào lên Kafka (kể cả `gbfs.invalid`), log `Giữ lại ...: feed không xử lý được`, `raw.json` được giữ trên máy (và lưu lên MinIO raw nếu bật) để kiểm tra; thư mục này không `--replay` được vì không có `valid.jsonl` (xem "Lỗi cấp feed" trong `ingestion/gbfs/README.md`).
 
@@ -37,7 +37,7 @@ Message sai được đưa về đúng dạng `gbfs.invalid` (`source, error_typ
 | `bronze.gbfs_status` | `gbfs.station_status` | `STATUS_CHECKPOINT_LOCATION` = `s3a://checkpoints/status-history/` |
 | `bronze.gbfs_station_information` | `gbfs.station_information` | `INFORMATION_CHECKPOINT_LOCATION` = `s3a://checkpoints/information-history/` |
 
-- **Grain:** một dòng = một message Kafka, khóa `(kafka_topic, kafka_partition, kafka_offset)`.
+- **Grain:** một dòng = một message Kafka, khóa `(kafka_topic, kafka_partition, kafka_offset, kafka_timestamp)`. Sink, DQ (`bronze_*_no_duplicate_messages`) và test dùng cùng khóa này. `kafka_timestamp` có mặt để phân biệt các "thế hệ" của một topic bị xóa rồi tạo lại (offset bắt đầu lại từ 0). Đây là giả định chứ không phải định danh thế hệ được bảo đảm: hai message của hai thế hệ cùng offset và cùng millisecond sẽ bị coi là một. Check `bronze_*_offset_reused` (warn) cho biết khi nào offset đã bị dùng lại; sau khi tạo lại topic, ghi việc đó vào runbook.
 - **Append-only, không lọc, không dedup:** message sai vẫn được ghi, kèm `dq_is_valid`, `dq_error_type`, `dq_error_message`. Silver đọc từ Bronze và lọc theo `dq_is_valid`.
 - `raw_value` là value Kafka nguyên văn, để dựng lại Silver từ Bronze khi đổi logic parse.
 - `poll_id`, `station_id`, `collected_at` (timestamp) được tách ra từ message cho việc lọc, đọc incremental và dedup ở Silver; null khi message không parse được.
@@ -57,7 +57,7 @@ Message sai được đưa về đúng dạng `gbfs.invalid` (`source, error_typ
 - **Nguồn:** đọc `bronze.gbfs_status` incremental (Iceberg streaming source), checkpoint `SILVER_STATUS_CHECKPOINT_LOCATION` = `s3a://checkpoints/silver-status/`. Checkpoint này **phải nằm trên S3/MinIO**: Iceberg source ghi offset bằng S3FileIO của bảng.
 - **Validation:** parse + validate lại `raw_value` bằng cùng schema và luật của STR-07 (không tin cờ `dq_is_valid` đã lưu ở Bronze), nên đổi luật thì dựng lại Silver từ Bronze được. Message sai chỉ nằm ở Bronze.
 - **Dedup:** message phát lại cùng `(station_id, poll_id)` (producer retry, `--replay`) chỉ còn một dòng; giữ Kafka offset nhỏ nhất.
-- **Một `collected_at` cho mỗi lần polling:** bảng phụ `silver.gbfs_status_polls` (`poll_id`, `collected_at`) ghi `collected_at` của mọi lần polling đã vào Silver (lần đầu tạo thì lấy từ Silver hiện có). Poll mới lấy `collected_at` của message đầu tiên (Kafka offset nhỏ nhất). Message có `poll_id` đã biết nhưng `collected_at` khác (producer hỏng) **không vào Silver**, vẫn nằm ở Bronze, log `[silver] … rows dropped` và check `silver_status_poll_time_conflicts` (warn) đếm chúng. Bảng phụ được ghi trước MERGE: crash giữa hai bước thì batch chạy lại thấy poll với cùng thời gian.
+- **Một `collected_at` cho mỗi lần polling:** bảng phụ `silver.gbfs_status_polls` (`poll_id`, `collected_at`) ghi `collected_at` của mọi lần polling đã vào Silver (lần đầu tạo thì lấy từ Silver hiện có). Poll mới lấy `collected_at` của message đầu tiên (Kafka offset nhỏ nhất). Message có `poll_id` đã biết nhưng `collected_at` khác (producer hỏng) **không vào Silver**, vẫn nằm ở Bronze, log `[silver] … rows dropped` và check `silver_status_poll_time_conflicts` (warn) đếm chúng. Bảng phụ được ghi trước MERGE: crash giữa hai bước thì batch chạy lại thấy poll với cùng thời gian. Thứ tự trong một batch: **xác định thời gian poll và loại message sai thời gian trước, rồi mới dedup**; dedup trước có thể giữ message sai và bỏ mất message đúng của cùng khóa. Lần đầu tạo bảng phụ trên một Silver đã có dữ liệu, job **từ chối chạy** nếu Silver có `poll_id` mang nhiều `collected_at` (lỗi in ra câu SQL liệt kê chúng); dọn các dòng đó rồi chạy lại.
 - **Idempotent:** `MERGE ... ON (station_id, poll_id) WHEN NOT MATCHED THEN INSERT *`. Micro-batch chạy lại, hoặc mất checkpoint Silver rồi đọc lại toàn bộ Bronze, không thêm dòng trùng, bất kể `collected_at` của message chạy lại cách bao xa.
 - **Prune partition:** vì mọi dòng của một poll có cùng `collected_at`, điều kiện MERGE có thêm `t.collected_at = s.collected_at` và khoảng `collected_at` của batch, tính bằng micro giây epoch (`timestamp_micros`, không phụ thuộc timezone của driver hay session Spark): MERGE chỉ đọc các partition ngày của batch.
 - `last_updated`, `last_reported` (epoch giây) và `collected_at` được đổi sang `TIMESTAMP` UTC, giữ riêng từng cột. Cột lineage: `kafka_partition`, `kafka_offset`, `bronze_ingested_at`, `silver_processed_at`.
@@ -80,6 +80,7 @@ docker compose --profile pipeline start spark-streaming
 | Check `silver_status` | Mức | Ý nghĩa |
 |---|---|---|
 | `silver_status_grain_unique` | error | Không có hai dòng cùng `(station_id, poll_id)` |
+| `silver_status_one_collected_at_per_poll` | error | Mỗi `poll_id` chỉ có một `collected_at` (MERGE dựa vào điều này) |
 | `silver_status_required_not_null` | error | Các cột bắt buộc không null |
 | `silver_status_counts_non_negative` | error | Số xe, số dock không âm |
 | `silver_status_has_every_valid_bronze_key` | error | Mọi khóa hợp lệ ở Bronze đều có ở Silver (không mất) |
@@ -88,7 +89,7 @@ docker compose --profile pipeline start spark-streaming
 | `silver_status_poll_time_conflicts` | warn | Message hợp lệ ở Bronze có `poll_id` đã ghi nhận với `collected_at` khác (bị giữ ngoài Silver, không tính là "thiếu") |
 | `silver_status_last_reported_not_after_collected` | warn | `last_reported` sau `collected_at` |
 
-Hai check đối soát với Bronze so Silver với các khóa Bronze **hợp lệ theo luật hiện tại**: `dq_checks.py` validate lại `raw_value` bằng cùng code Silver dùng, không tin cờ `dq_is_valid` đã lưu lúc ingest. Chúng chỉ đúng khi Bronze đứng yên và Silver đã bắt kịp (như lệnh trên: dừng service, `--available-now`, rồi DQ); nếu Bronze commit thêm sau lần chạy cuối của Silver, các khóa đó bị báo là thiếu. Layer `bronze_status` có thêm check không trùng offset.
+Hai check đối soát với Bronze so Silver với các khóa Bronze **hợp lệ theo luật hiện tại**: `dq_checks.py` validate lại `raw_value` bằng cùng code Silver dùng, không tin cờ `dq_is_valid` đã lưu lúc ingest. Chúng chỉ đúng khi Bronze đứng yên và Silver đã bắt kịp (như lệnh trên: dừng service, `--available-now`, rồi DQ); nếu Bronze commit thêm sau lần chạy cuối của Silver, các khóa đó bị báo là thiếu. Layer `bronze_status` kiểm tra không trùng message (`no_duplicate_messages`, error) và offset bị dùng lại (`offset_reused`, warn).
 
 ### Giữ snapshot và dựng lại Silver
 
@@ -148,6 +149,7 @@ docker compose exec spark-master /opt/spark/bin/spark-submit \
 | Check `silver_information` | Mức | Ý nghĩa |
 |---|---|---|
 | `silver_information_grain_unique` | error | Không có hai dòng cùng `(station_id, poll_id)` |
+| `silver_information_one_collected_at_per_poll` | error | Mỗi `poll_id` chỉ có một `collected_at` |
 | `silver_information_has_every_valid_bronze_key` / `_only_valid_bronze_keys` | error | Silver khớp tập khóa hợp lệ của Bronze (không thiếu, không thừa) |
 | `silver_information_required_not_null` | error | `station_id`, `poll_id`, `collected_at`, `last_updated`, `name`, `lat`, `lon` không null |
 | `silver_information_coordinates_in_range` | error | `lat` trong [-90, 90], `lon` trong [-180, 180] |
@@ -271,7 +273,7 @@ Chưa kiểm tra: đọc Bronze bằng Trino; crash giữa lúc commit Iceberg (
 | Dữ liệu thật: `gbfs-poller` → Kafka → service `spark-streaming` (Bronze + Silver), restart giữa chừng | 3 lần polling → `silver.gbfs_status` 7557 dòng = 3 × 2519, 7557 khóa khác nhau; `dq_checks --layer silver_status` 7/7 PASS |
 
 Ghi chú: khi mất checkpoint Silver và đọc lại Bronze, MERGE không thêm dòng nhưng Iceberg vẫn ghi một snapshot rỗng.
-Sau review (24/11/2026): `str09_silver.sh` 12/12, thêm cùng khóa với `collected_at` lệch 1 phút và 2 ngày (vẫn 4 dòng; DQ pass, `silver_status_poll_time_conflicts` cảnh báo 2 dòng) và replay toàn bộ với session time zone `Asia/Ho_Chi_Minh`.
+Sau review (24–25/11/2026): `str09_silver.sh` 12/12, thêm cùng khóa với `collected_at` lệch 1 phút và 2 ngày (vẫn 4 dòng; DQ pass, `silver_status_poll_time_conflicts` cảnh báo 2 dòng) và replay toàn bộ với session time zone `Asia/Ho_Chi_Minh`.
 Chưa kiểm tra: đọc Silver bằng Trino; xóa snapshot cũ của Bronze (maintenance) khi query Silver đang chạy.
 
 ### Kết quả STR-10 (23/11/2026)
@@ -297,7 +299,7 @@ Chưa kiểm tra: đọc Silver bằng Trino; xóa snapshot cũ của Bronze (ma
 
 `tests/integration/test_spark_recovery.py` chạy các kịch bản của contract mục 2.4 bằng lỗi thật trên stack thật, cho cả Bronze (Kafka → Iceberg append) và Silver (Bronze → Iceberg MERGE). Sau mỗi kịch bản kiểm tra: Bronze theo từng partition bằng end offset Kafka, không có `(topic, partition, offset)` trùng, Silver có đúng số khóa đã gửi. Test chỉ chạy khi `COMPOSE_PROJECT_NAME` kết thúc bằng `-itest`; topic, bảng, checkpoint có hậu tố theo lượt chạy; chỉ kill driver mang checkpoint của lượt đó; log đầy đủ từng bước được giữ trong thư mục in ra lúc bắt đầu.
 
-| Kịch bản (contract 2.4) | Cách gây lỗi | Kết quả (24/11/2026, 7/7 pass, khoảng 23 phút) |
+| Kịch bản (contract 2.4) | Cách gây lỗi | Kết quả (25/11/2026, 7/7 pass, khoảng 23 phút) |
 |---|---|---|
 | Chạy bình thường 100 message | — | Bronze 100 dòng (30 / 40 / 30 = end offset), Silver 100 |
 | Crash **sau Iceberg commit, trước checkpoint commit** | Xóa `commits/<n>` của batch cuối (test xác nhận file đã mất và batch `n` thành "chưa commit"), chạy lại | Batch `n` được chạy lại, thấy mọi message đã có: Bronze vẫn 200 dòng, **không thêm snapshot**, đọc được bình thường; Silver vẫn 200 |
@@ -305,7 +307,7 @@ Chưa kiểm tra: đọc Silver bằng Trino; xóa snapshot cũ của Bronze (ma
 | Crash **sau khi checkpoint hoàn tất** | Chạy lại khi không có dữ liệu mới | Cả Bronze và Silver: không batch mới, không snapshot mới, `offsets/` và `commits/` không đổi |
 | **MinIO mất giữa lượt chạy** | `docker pause minio` ngay sau batch đầu tiên của lượt 10 000 message | Lần này job **tự dừng sau 183 giây** (exit 1); lần chạy trước (bản `8be6bad`) nó treo trong retry hơn 300 giây và test phải kill. Bronze dừng ở 22 200 / 30 200 (các batch trước khi mất MinIO đã commit). Bật lại MinIO và chạy lại: 30 200 = end offset, Silver 30 200, 0 trùng |
 | **Snapshot Bronze bị expire** (ngoài contract, theo review) | `expire_snapshots` giữ lại 1 snapshot khi Silver còn chưa đọc phần mới | Silver với checkpoint cũ dừng (exit 1). `silver_status.py --rebuild` với checkpoint mới: Silver 30 600 = toàn bộ khóa; checkpoint mới đọc tiếp lần append sau (30 700) |
-| **Snapshot của batch vừa commit bị expire trước khi chạy lại** (theo review) | Xóa `commits/<n>` của batch cuối, compact Bronze (`rewrite_data_files`, snapshot mới cùng dữ liệu), `expire_snapshots` giữ 1 snapshot: snapshot do batch `n` tạo không còn | Batch `n` chạy lại: `100 of 100 messages already in Bronze, skipped`, Bronze vẫn 30 800 dòng, vẫn 1 snapshot, 0 trùng |
+| **Snapshot của batch vừa commit bị expire trước khi chạy lại** (theo review) | Xóa `commits/<n>` của batch cuối, compact Bronze (`rewrite_data_files`, snapshot mới cùng dữ liệu), `expire_snapshots` giữ 1 snapshot: snapshot do batch `n` tạo không còn. Test assert compaction viết lại file (19 file), snapshot hiện tại đã đổi và ID snapshot của batch `n` không còn trong lịch sử | Batch `n` chạy lại: `100 of 100 messages already in Bronze, skipped`, Bronze vẫn 30 800 dòng, vẫn 1 snapshot, 0 trùng |
 
 | Tiêu chí | Kết luận |
 |---|---|

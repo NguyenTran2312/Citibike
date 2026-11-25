@@ -77,20 +77,42 @@ def first_per_key(df: DataFrame) -> DataFrame:
     return df.withColumn("_rank", F.row_number().over(first)).filter("_rank = 1").drop("_rank")
 
 
+def polls_with_several_times(silver: DataFrame) -> DataFrame:
+    """poll_id values that have more than one collected_at in a Silver table."""
+    return (silver.groupBy("poll_id").agg(F.countDistinct("collected_at").alias("n"))
+            .filter("n > 1").select("poll_id"))
+
+
 def ensure_polls_table(spark: SparkSession, silver_table: str) -> str:
     """Create <silver_table>_polls; filled from Silver the first time, so a Silver
-    table built before the poll table existed keeps its guarantee."""
+    table built before the poll table existed keeps its guarantee.
+
+    Refuses to fill it when Silver already has a poll with several collected_at
+    (written before this guarantee existed): the MERGE matches on the poll's time,
+    so such rows would let the same key be inserted again.
+    """
     polls = polls_table(silver_table)
     spark.sql(POLLS_DDL.format(table=polls))
     if (_iceberg_table(spark, polls).currentSnapshot() is None
             and _iceberg_table(spark, silver_table).currentSnapshot() is not None):
+        bad = polls_with_several_times(spark.table(silver_table)).count()
+        if bad:
+            raise SystemExit(
+                f"{silver_table} has {bad} poll_id(s) with several collected_at; keep one "
+                f"collected_at per poll (delete the other rows) before starting. List them: "
+                f"SELECT poll_id, collected_at, count(*) FROM {silver_table} GROUP BY 1, 2 "
+                f"HAVING poll_id IN (SELECT poll_id FROM {silver_table} GROUP BY poll_id "
+                f"HAVING count(DISTINCT collected_at) > 1)")
         spark.sql(f"INSERT INTO {polls} SELECT poll_id, min(collected_at) "
                   f"FROM {silver_table} GROUP BY poll_id")
     return polls
 
 
 def split_by_poll_time(rows: DataFrame, polls: str):
-    """(rows to merge, polls new to Silver, number of rows dropped).
+    """(rows with their poll's collected_at, polls new to Silver, number of rows dropped).
+
+    `rows` are all valid messages, NOT deduplicated yet: deduplicating first could
+    keep a message with the wrong time and drop the right one for the same key.
 
     A poll's collected_at is the one already recorded in `polls`, or for a new poll
     the collected_at of its first message (lowest Kafka position). Rows with another
@@ -115,15 +137,23 @@ def split_by_poll_time(rows: DataFrame, polls: str):
     return accepted, new_polls, dropped
 
 
+def merge_candidates(rows: DataFrame, polls: str):
+    """Valid messages -> (one row per key with the poll's collected_at, new polls,
+    rows dropped for a wrong collected_at): poll time first, then deduplication."""
+    accepted, new_polls, dropped = split_by_poll_time(rows, polls)
+    return first_per_key(accepted), new_polls, dropped
+
+
 def merge_new_keys(rows: DataFrame, table: str, view: str) -> int:
     """Insert the (station_id, poll_id) keys `table` does not have yet; returns the
-    number of candidate rows. ensure_polls_table(table) must have run."""
+    number of candidate rows. `rows`: typed valid messages, not deduplicated (the
+    *_candidates functions). ensure_polls_table(table) must have run."""
     spark = rows.sparkSession
     polls = polls_table(table)
     rows = rows.cache()
     accepted = new_polls = None
     try:
-        accepted, new_polls, dropped = split_by_poll_time(rows, polls)
+        accepted, new_polls, dropped = merge_candidates(rows, polls)
         accepted, new_polls = accepted.cache(), new_polls.cache()
         # Epoch microseconds, not datetime literals: independent of the driver's
         # and the session's time zone.

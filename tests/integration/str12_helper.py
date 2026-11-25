@@ -5,6 +5,7 @@
     str12_helper.py rm <path>                              -> STR12_RESULT {"deleted": bool}
     str12_helper.py expire <table>                         -> expire all but the current snapshot
     str12_helper.py compact <table>                        -> rewrite every data file (new snapshot, same rows)
+    str12_helper.py snapshot-ids <table>                   -> {"current": id, "ids": [every snapshot id]}
     str12_helper.py drop <table> [<table> ...]             -> DROP TABLE ... PURGE
 """
 import json
@@ -33,7 +34,9 @@ def table_stats(spark: SparkSession, table: str, bronze: bool):
         result["per_partition"] = {
             str(r.kafka_partition): r.n
             for r in df.groupBy("kafka_partition").agg(F.count(F.lit(1)).alias("n")).collect()}
-        result["duplicate_offsets"] = (df.groupBy("kafka_topic", "kafka_partition", "kafka_offset")
+        # Same message identity as the Bronze sink and the DQ check.
+        result["duplicate_offsets"] = (df.groupBy("kafka_topic", "kafka_partition", "kafka_offset",
+                                                  "kafka_timestamp")
                                        .count().filter("count > 1").count())
     else:
         result["distinct_keys"] = df.select("station_id", "poll_id").distinct().count()
@@ -73,6 +76,12 @@ def main() -> None:
                         f"older_than => TIMESTAMP '{cutoff}', retain_last => 1)").first()
         emit({"deleted_manifest_lists": row["deleted_manifest_lists_count"],
               "snapshots": snapshots(spark, args[0])})
+    elif action == "snapshot-ids":
+        table = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(
+            spark._jsparkSession, args[0])
+        current = table.currentSnapshot()
+        emit({"current": current.snapshotId() if current is not None else None,
+              "ids": sorted(s.snapshotId() for s in table.snapshots())})
     elif action == "compact":
         catalog, name = args[0].split(".", 1)
         row = spark.sql(f"CALL {catalog}.system.rewrite_data_files(table => '{name}', "

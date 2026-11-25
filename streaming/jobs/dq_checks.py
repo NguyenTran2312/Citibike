@@ -46,10 +46,18 @@ Check = Tuple[str, str, str]  # (name, severity, SQL returning the number of bad
 
 def _bronze_checks(prefix: str, b: str) -> List[Check]:
     return [
-        (f"{prefix}_no_duplicate_offsets", "error", f"""
+        # A Kafka message is (topic, partition, offset, kafka_timestamp), the same key
+        # the Bronze sink deduplicates on (gbfs_history.MESSAGE_KEY).
+        (f"{prefix}_no_duplicate_messages", "error", f"""
+            SELECT count(*) FROM (
+              SELECT kafka_topic, kafka_partition, kafka_offset, kafka_timestamp FROM {b}
+              GROUP BY 1, 2, 3, 4 HAVING count(*) > 1)"""),
+        # The same offset with another timestamp: the topic was deleted and
+        # recreated (offsets restarted). Expected after that operation only.
+        (f"{prefix}_offset_reused", "warn", f"""
             SELECT count(*) FROM (
               SELECT kafka_topic, kafka_partition, kafka_offset FROM {b}
-              GROUP BY 1, 2, 3 HAVING count(*) > 1)"""),
+              GROUP BY 1, 2, 3 HAVING count(DISTINCT kafka_timestamp) > 1)"""),
         (f"{prefix}_raw_value_kept", "error",
          f"SELECT count(*) FROM {b} WHERE raw_value IS NULL AND dq_error_type IS NULL"),
     ]
@@ -69,6 +77,10 @@ def _silver_key_checks(prefix: str, b: str, s: str) -> List[Check]:
         (f"{prefix}_grain_unique", "error", f"""
             SELECT count(*) FROM (
               SELECT station_id, poll_id FROM {s} GROUP BY 1, 2 HAVING count(*) > 1)"""),
+        # The MERGE matches on the poll's collected_at: one per poll.
+        (f"{prefix}_one_collected_at_per_poll", "error", f"""
+            SELECT count(*) FROM (
+              SELECT poll_id FROM {s} GROUP BY 1 HAVING count(DISTINCT collected_at) > 1)"""),
         # Every valid Bronze key is in Silver (nothing dropped) ...
         (f"{prefix}_has_every_valid_bronze_key", "error", f"""
             SELECT count(*) FROM {valid_keys} v
@@ -122,7 +134,7 @@ def checks(layer: str, bronze: str, silver: str) -> List[Check]:
     raise ValueError(f"unknown layer {layer}")
 
 
-def create_valid_keys_view(spark: SparkSession, layer: str, bronze: str, polls: str) -> None:
+def create_valid_keys_view(spark: SparkSession, layer: str, bronze: str, polls: str):
     """Bronze keys that pass validation now (the same code path Silver uses), minus
     the messages whose poll Silver recorded with another collected_at."""
     from pyspark.sql import functions as F
@@ -141,21 +153,27 @@ def create_valid_keys_view(spark: SparkSession, layer: str, bronze: str, polls: 
     valid.filter(conflict).createOrReplaceTempView(CONFLICT_VIEW)
     (valid.filter(~conflict).select("station_id", "poll_id").distinct()
      .createOrReplaceTempView(VALID_KEYS_VIEW))
+    return valid   # cached: unpersist after the checks
 
 
 def run(spark: SparkSession, layer: str, bronze: str, silver: str,
         polls: str | None = None) -> bool:
     """`polls`: the Silver table's poll table, default <silver>_polls."""
+    cached = None
     if layer.startswith("silver_"):
         from streaming.jobs.silver import polls_table
-        create_valid_keys_view(spark, layer, bronze, polls or polls_table(silver))
+        cached = create_valid_keys_view(spark, layer, bronze, polls or polls_table(silver))
     ok = True
-    for name, severity, sql in checks(layer, bronze, silver):
-        bad = spark.sql(sql).collect()[0][0]
-        status = "PASS" if bad == 0 else ("FAIL" if severity == "error" else "WARN")
-        print(f"[{status}] {name}: {bad} bad rows", flush=True)
-        if bad and severity == "error":
-            ok = False
+    try:
+        for name, severity, sql in checks(layer, bronze, silver):
+            bad = spark.sql(sql).collect()[0][0]
+            status = "PASS" if bad == 0 else ("FAIL" if severity == "error" else "WARN")
+            print(f"[{status}] {name}: {bad} bad rows", flush=True)
+            if bad and severity == "error":
+                ok = False
+    finally:
+        if cached is not None:
+            cached.unpersist()
     return ok
 
 
