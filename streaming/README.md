@@ -27,6 +27,8 @@ Guardrail chỉ nhắm các lỗi **có thể xảy ra thật** trong dự án. 
 | Không xóa / tạo lại topic `gbfs.*` khi pipeline đang chạy; nếu buộc phải làm, ghi vào runbook | Message mới trùng cả offset lẫn millisecond với message cũ bị bỏ qua | — |
 | Spark không dừng lâu hơn retention Kafka (7 ngày) | Thiếu dữ liệu; query Bronze dừng thay vì chạy tiếp (`FAIL_ON_DATA_LOSS`) | Lỗi query |
 
+Ngoại lệ có chủ đích: giới hạn epoch ≤ 4102444800 (năm 2100) chặn một ca **hiếm** (feed hoặc code gửi mili/micro giây thay vì giây). Nó được giữ vì chỉ tốn một điều kiện, còn hậu quả khi không chặn là `long overflow` làm dừng cả batch Silver.
+
 Lỗi thường gặp mà pipeline **phải tự chịu được** (có test trong STR-12): Spark hoặc container crash / restart ở bất kỳ bước nào, batch chạy lại sau khi Iceberg đã commit, MinIO mất tạm thời, producer gửi lại (retry, `--replay`), mất checkpoint Silver, snapshot Bronze bị expire.
 
 ## Phân loại message
