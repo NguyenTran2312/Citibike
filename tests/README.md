@@ -46,6 +46,34 @@ bash tests/integration/str10_silver_information.sh   # Silver information: đủ
 python -m unittest tests.integration.test_spark_recovery -v   # STR-12: crash/restart Spark (COMPOSE_PROJECT_NAME *-itest, confluent-kafka trên host, ~25 phút)
 ```
 
+### Streaming Core gate (trước khi merge Streaming Core vào `main`)
+
+Chạy trong một Compose project riêng; hai script tự từ chối chạy nếu `COMPOSE_PROJECT_NAME` không kết thúc bằng `-itest`. `docker-compose.yml` đặt `name: citibike`, nên thiếu biến này thì lệnh sẽ đụng vào stack dev. Stack dev phải dừng trước (cùng port trên host), không xóa volume:
+
+```bash
+docker compose -p citibike stop
+export COMPOSE_PROJECT_NAME=citibike-itest
+
+# Gate 14: Trino đọc 4 bảng Bronze/Silver mà Spark ghi từ fixture
+# (số dòng khớp Spark, kiểu lồng ARRAY<ROW>/ROW, timestamp with time zone)
+docker compose up -d --build
+bash tests/integration/str_trino_read.sh
+
+# Gate 2, 3, 5, 7, 10, 11, 12, 13 trên pipeline chạy thật (poller → Kafka →
+# PostgreSQL và Spark → Bronze → Silver). Mặc định dùng GBFS giả lập 2519 trạm
+# (gbfs_mock.py); GATE_SOURCE=real để dùng API GBFS thật. RUN_EXTRA=1 chạy thêm
+# smoke test (gate 15), str_trino_read.sh (gate 14) và test_latest_state_recovery
+# (gate 8, 9; cần confluent-kafka, psycopg trên host). Khoảng 15 phút.
+RUN_EXTRA=1 bash tests/integration/streaming_core_gate.sh
+GATE_SOURCE=real bash tests/integration/streaming_core_gate.sh
+
+# Dọn project itest (chỉ volume của citibike-itest), rồi bật lại stack dev
+docker compose -p citibike-itest down -v
+docker compose -p citibike start
+```
+
+Script không xóa gì khi kết thúc, để còn xem lại dữ liệu; log mỗi bước nằm trong thư mục in ra ở đầu.
+
 ### Latest State Consumer với Kafka và PostgreSQL thật (STR-05/06)
 
 `test_latest_state_recovery.py` chạy trên một Compose project riêng nên không
