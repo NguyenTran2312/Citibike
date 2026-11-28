@@ -318,7 +318,17 @@ docker compose --profile pipeline exec gbfs-poller ls /app/data/gbfs/station_sta
   không, không gửi gì và giữ thư mục. Khi replay, output chuẩn hóa thiếu
   (poller bị kill hoặc lỗi I/O giữa lúc ghi, file rỗng hoặc dòng ghi dở) được
   chuẩn hóa lại từ `raw.json` với `poll_id` và `collected_at` gốc, và
-  `kafka_delivery.json` cũ bị bỏ để gửi lại cả lần polling.
+  `kafka_delivery.json` cũ bị bỏ để gửi lại cả lần polling. Marker được bỏ
+  **trước** khi ghi lại output: process chết ở bất kỳ đâu sau đó thì lần replay
+  sau không còn marker và gửi lại cả lần polling. Không xóa được marker thì
+  replay dừng, không sửa output.
+- Giới hạn: kiểm tra trên là **kiểm tra số lượng**, không so nội dung với
+  `raw.json`. Nó đúng với giả định có một writer cho mỗi thư mục polling (chỉ
+  poller, không chạy `--replay` tay song song) và một lần ghi bị ngắt chỉ để
+  lại một *tiền tố* của output. File bị sửa tay hoặc hỏng giữa chừng mà vẫn đủ
+  số dòng (ví dụ B bị thay bằng bản sao của A) sẽ không bị phát hiện. Thứ tự
+  "bỏ marker rồi mới ghi" đúng khi process bị kill (SIGKILL, OOM, container
+  dừng); không có `fsync`, nên mất điện hoặc OS crash không được bảo đảm.
 - Thư mục của feed sai cấu trúc (`raw.json` không chuẩn hóa được) không replay được.
 
 ## Lưu raw JSON lên MinIO (STR-04)

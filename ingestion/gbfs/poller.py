@@ -237,6 +237,14 @@ def check_normalized(output_dir):
         )
 
 
+def invalidate_delivery(output_dir):
+    """Bỏ kafka_delivery.json: Kafka đã xác nhận một bản không đủ của lần polling.
+
+    Chỉ bỏ qua khi file không có; lỗi khác (quyền, I/O) được ném ra.
+    """
+    (output_dir / "kafka_delivery.json").unlink(missing_ok=True)
+
+
 def replay_poll(output_dir):
     """Gửi lại một thư mục polling đã bị giữ lại, với đúng poll_id cũ.
 
@@ -257,6 +265,10 @@ def replay_poll(output_dir):
         check_normalized(output_dir)
     except IncompletePollError as incomplete:
         logger.warning("Chuẩn hóa lại từ raw.json: %s", incomplete)
+        # Xóa xác nhận cũ TRƯỚC khi output có thể thành đủ: bị ngắt ở bất kỳ
+        # đâu sau bước này, lần replay sau không còn marker nên gửi lại cả lần
+        # polling. Xóa lỗi thì dừng ở đây, không sửa output.
+        invalidate_delivery(output_dir)
         try:
             write_messages(feed_name, raw["payload"], raw["poll_id"],
                            collected_at, output_dir)
@@ -265,8 +277,6 @@ def replay_poll(output_dir):
                 f"{output_dir}: raw.json không chuẩn hóa được (feed lỗi), "
                 f"không replay được: {error!r}"
             ) from error
-        # Kafka đã xác nhận một bản không đủ: gửi lại cả lần polling.
-        (output_dir / "kafka_delivery.json").unlink(missing_ok=True)
 
     finish_poll(
         feed_name,

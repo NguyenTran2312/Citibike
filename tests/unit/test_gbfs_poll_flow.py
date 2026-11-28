@@ -324,6 +324,204 @@ class TestInterruptedNormalization(unittest.TestCase):
         self.assertTrue((self.poll_dir / "raw.json").exists())
 
 
+class Interrupted(BaseException):
+    """Process chết giữa chừng: không phải Exception, nên không handler nào bắt
+    (finish_poll chỉ bắt Exception), giống SIGKILL ở đúng điểm được chọn."""
+
+
+class FakeKafkaClient:
+    """Thay confluent_kafka.Producer bên dưới GBFSProducer thật: giữ message
+    cho tới flush() rồi xác nhận, ghi lại (topic, key, value) đã được ack."""
+
+    acked = []
+
+    def __init__(self, config):
+        self.pending = []
+
+    def produce(self, topic, key, value, on_delivery):
+        self.pending.append((topic, key, value, on_delivery))
+
+    def poll(self, timeout):
+        return 0
+
+    def flush(self, timeout):
+        for topic, key, value, on_delivery in self.pending:
+            FakeKafkaClient.acked.append((topic, key.decode() if key else None,
+                                          json.loads(value)))
+            on_delivery(None, Mock(topic=Mock(return_value=topic)))
+        self.pending = []
+        return 0
+
+
+class TestRepairInterruption(unittest.TestCase):
+    """Replay đang sửa một lần polling chưa đủ mà bị ngắt (process chết) ở ranh
+    giới giữa bỏ xác nhận Kafka cũ và ghi lại valid.jsonl / invalid.jsonl.
+
+    Trạng thái ban đầu (independent review 84f6cd7): raw.json có A, B (hợp lệ)
+    và C (sai schema); valid.jsonl chỉ có A; kafka_delivery.json cũ xác nhận
+    đúng một message A. Đi qua replay_poll, finish_poll, publish_poll_output và
+    GBFSProducer thật; chỉ client Kafka và upload MinIO là giả.
+    """
+
+    POLL_ID = "station_status-99999999-8888-4777-8666-555555555555"
+    COLLECTED_AT = datetime(2026, 11, 28, 4, 0, 0, 654321, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.data_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.data_dir, ignore_errors=True)
+        self.env = {
+            "GBFS_DATA_DIR": str(self.data_dir),
+            "GBFS_PUBLISH_KAFKA": "true",
+            "GBFS_ARCHIVE_RAW": "true",
+            "GBFS_STATUS_TOPIC": "gbfs.station_status",
+            "GBFS_INVALID_TOPIC": "gbfs.invalid",
+        }
+        FakeKafkaClient.acked = []
+        self.archive = Mock(return_value="s3://raw/x")
+        for target, mock in (
+            ("ingestion.gbfs.producer.Producer", FakeKafkaClient),
+            ("ingestion.gbfs.raw_storage.upload_raw_json", self.archive),
+        ):
+            patcher = patch(target, mock)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        self.poll_dir = self.data_dir / "station_status" / self.POLL_ID
+        self.poll_dir.mkdir(parents=True)
+        (self.poll_dir / "raw.json").write_text(json.dumps({
+            "poll_id": self.POLL_ID,
+            "source_url": "https://example.com/s.json",
+            "collected_at": self.COLLECTED_AT.isoformat(),
+            "payload": TWO_STATIONS,
+        }), encoding="utf-8")
+        with self.assertLogs("ingestion.gbfs.poller", level="INFO"):
+            poller.write_messages("station_status", TWO_STATIONS, self.POLL_ID,
+                                  self.COLLECTED_AT, self.poll_dir)
+        only_a = (self.poll_dir / "valid.jsonl").read_text(encoding="utf-8").splitlines(True)[0]
+        (self.poll_dir / "valid.jsonl").write_text(only_a, encoding="utf-8")
+        (self.poll_dir / "invalid.jsonl").write_text("", encoding="utf-8")
+        self.marker = self.poll_dir / "kafka_delivery.json"
+        self.marker.write_text(json.dumps({
+            "feed_name": "station_status", "poll_id": self.POLL_ID,
+            "confirmed": {"gbfs.station_status": 1},
+        }), encoding="utf-8")
+
+    def replay(self):
+        with patch.dict("os.environ", self.env), \
+                self.assertLogs("ingestion.gbfs.poller", level="INFO"):
+            poller.replay_poll(self.poll_dir)
+
+    def replay_interrupted(self, **patches):
+        """Replay với các hàm của poller bị thay (patches), phải chết với Interrupted."""
+        with patch.dict("os.environ", self.env), \
+                self.assertLogs("ingestion.gbfs.poller", level="INFO"), \
+                patch.multiple(poller, **patches), \
+                self.assertRaises(Interrupted):
+            poller.replay_poll(self.poll_dir)
+
+    def lines(self, name):
+        return (self.poll_dir / name).read_text(encoding="utf-8").splitlines()
+
+    def assert_untouched_spool(self, marker):
+        self.assertEqual(FakeKafkaClient.acked, [])
+        self.assertTrue(self.poll_dir.exists())
+        self.assertEqual(self.marker.exists(), marker)
+
+    def assert_whole_poll_delivered_then_cleaned(self):
+        status = [(k, v) for t, k, v in FakeKafkaClient.acked if t == "gbfs.station_status"]
+        invalid = [(k, v) for t, k, v in FakeKafkaClient.acked if t == "gbfs.invalid"]
+        self.assertEqual({t for t, _, _ in FakeKafkaClient.acked},
+                         {"gbfs.station_status", "gbfs.invalid"})
+        # B và C (chưa từng tới Kafka) được gửi; A gửi lại, downstream dedup.
+        self.assertEqual(sorted(k for k, _ in status), ["station-a", "station-b"])
+        self.assertEqual([k for k, _ in invalid], ["station-c"])
+        self.assertEqual(invalid[0][1]["raw_payload"]["station_id"], "station-c")
+        for key, message in status:
+            self.assertEqual(message["station_id"], key)       # Kafka key = station_id
+            self.assertEqual(message["poll_id"], self.POLL_ID)
+            self.assertEqual(
+                datetime.fromisoformat(message["collected_at"].replace("Z", "+00:00")),
+                self.COLLECTED_AT)
+            self.assertEqual(message["last_updated"], TWO_STATIONS["last_updated"])
+        self.archive.assert_called()
+        self.assertFalse(self.poll_dir.exists())
+
+    def test_interrupted_right_after_rebuild_then_restarted_delivers_the_whole_poll(self):
+        real_write = poller.write_messages
+
+        def write_then_die(*args):
+            real_write(*args)
+            raise Interrupted("after rebuild")
+
+        self.replay_interrupted(write_messages=write_then_die)
+        # Output đã đủ (A, B + C) nhưng chưa gì được gửi, spool còn nguyên.
+        self.assertEqual(len(self.lines("valid.jsonl")) + len(self.lines("invalid.jsonl")), 3)
+        self.assertTrue(self.poll_dir.exists())
+        self.assertEqual(FakeKafkaClient.acked, [])
+
+        self.replay()   # khởi động lại
+        self.assert_whole_poll_delivered_then_cleaned()
+
+    def test_obsolete_marker_is_gone_before_normalized_files_become_complete(self):
+        real_write = poller.write_messages
+        seen = []
+
+        def observe(*args):
+            seen.append(self.marker.exists())
+            real_write(*args)
+
+        with patch.object(poller, "write_messages", observe):
+            self.replay()
+        self.assertEqual(seen, [False])
+        self.assert_whole_poll_delivered_then_cleaned()
+
+    def test_interrupted_just_before_invalidation(self):
+        self.replay_interrupted(invalidate_delivery=Mock(side_effect=Interrupted("before")))
+        self.assert_untouched_spool(marker=True)
+        self.assertEqual(len(self.lines("valid.jsonl")), 1)   # chưa sửa gì
+
+        self.replay()
+        self.assert_whole_poll_delivered_then_cleaned()
+
+    def test_interrupted_just_after_invalidation(self):
+        real_invalidate = poller.invalidate_delivery
+
+        def invalidate_then_die(output_dir):
+            real_invalidate(output_dir)
+            raise Interrupted("after invalidation")
+
+        self.replay_interrupted(invalidate_delivery=invalidate_then_die)
+        self.assert_untouched_spool(marker=False)
+        self.assertEqual(len(self.lines("valid.jsonl")), 1)   # output chưa sửa
+
+        self.replay()
+        self.assert_whole_poll_delivered_then_cleaned()
+
+    def test_failure_to_invalidate_stops_the_repair(self):
+        rebuild = Mock()
+        with patch.dict("os.environ", self.env), \
+                self.assertLogs("ingestion.gbfs.poller", level="INFO"), \
+                patch.multiple(poller, write_messages=rebuild,
+                               invalidate_delivery=Mock(side_effect=PermissionError("read-only"))), \
+                self.assertRaises(PermissionError):
+            poller.replay_poll(self.poll_dir)
+        rebuild.assert_not_called()
+        self.assert_untouched_spool(marker=True)
+        self.assertEqual(len(self.lines("valid.jsonl")), 1)
+
+    def test_kafka_failure_after_repair_keeps_the_spool_until_a_later_success(self):
+        with patch.dict("os.environ", self.env), \
+                self.assertLogs("ingestion.gbfs.poller", level="INFO"), \
+                patch("ingestion.gbfs.producer.publish_poll_output",
+                      side_effect=RuntimeError("Kafka down")), \
+                self.assertRaises(RuntimeError):
+            poller.replay_poll(self.poll_dir)
+        self.assert_untouched_spool(marker=False)
+
+        self.replay()
+        self.assert_whole_poll_delivered_then_cleaned()
+
+
 class TestStopHandler(unittest.TestCase):
     def test_sigterm_requests_a_graceful_stop(self):
         previous = signal.getsignal(signal.SIGTERM)
