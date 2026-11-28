@@ -53,6 +53,7 @@ Chạy trong một Compose project riêng; hai script tự từ chối chạy n�
 ```bash
 docker compose -p citibike stop
 export COMPOSE_PROJECT_NAME=citibike-itest
+# export POSTGRES_PORT=55432   # nếu cổng 5432 trên host đã có PostgreSQL khác
 
 # Gate 14: Trino đọc 4 bảng Bronze/Silver mà Spark ghi từ fixture
 # (số dòng khớp Spark, kiểu lồng ARRAY<ROW>/ROW, timestamp with time zone)
@@ -72,7 +73,7 @@ docker compose -p citibike-itest down -v
 docker compose -p citibike start
 ```
 
-Script không xóa gì khi kết thúc, để còn xem lại dữ liệu; log mỗi bước nằm trong thư mục in ra ở đầu.
+Script không xóa gì khi kết thúc, để còn xem lại dữ liệu; log mỗi bước nằm trong thư mục in ra ở đầu. Chạy `streaming_core_gate.sh` trên một project itest **mới** (`down -v` trước): `test_latest_state_recovery` (với `RUN_EXTRA=1`) gửi message test lên `gbfs.station_status`, nên lần chạy gate sau trên cùng volume sẽ thấy các trạm `itest-*` trong Bronze/Silver mà PostgreSQL đã xóa.
 
 ### Latest State Consumer với Kafka và PostgreSQL thật (STR-05/06)
 

@@ -100,9 +100,11 @@ dc --profile pipeline up -d --build gbfs-poller latest-state-consumer spark-stre
 STARTED=$(date +%s)
 
 step "Gate 3: dependencies"
-want=$(grep -E '^(pydantic|confluent-kafka|psycopg\[binary\]|boto3)==' infra/python/requirements.txt \
-  | sed -E 's/.*==//' | tr '\n' ' ' | sed 's/ $//')
-got=$(dc run --rm --no-deps --entrypoint sh gbfs-poller -c 'pip check >/dev/null && python -c "
+pin() { grep -E "^$1==" infra/python/requirements.txt | sed 's/.*==//'; }
+want="$(pin boto3) $(pin pydantic) $(pin confluent-kafka) $(pin 'psycopg\[binary\]')"
+# The image the pipeline services run (built by `up --build` above); plain
+# docker run, because `compose run` of a build service prints the build log.
+got=$(docker run --rm --entrypoint sh citibike/python:local -c 'pip check >/dev/null && python -c "
 import boto3, confluent_kafka, psycopg, pydantic
 v = {\"pydantic\": pydantic.VERSION, \"confluent-kafka\": confluent_kafka.__version__,
      \"psycopg\": psycopg.__version__, \"boto3\": boto3.__version__}
@@ -115,7 +117,9 @@ sleep "$RUN_SECONDS"
 jars=$(dc exec -T spark-streaming sh -c 'ls /root/.ivy2/jars' 2>/dev/null)
 for jar in iceberg-spark-runtime-3.5_2.12-1.9.2.jar iceberg-aws-bundle-1.9.2.jar \
            spark-sql-kafka-0-10_2.12-3.5.6.jar hadoop-aws-3.3.4.jar; do
-  if grep -qx "$jar" <<<"$jars"; then gate 3 PASS "spark jar $jar"; else gate 3 FAIL "spark jar $jar missing"; fi
+  # Ivy names resolved jars <groupId>_<artifact>-<version>.jar
+  if grep -qE "(^|_)${jar//./\\.}\$" <<<"$jars"; then gate 3 PASS "spark jar $jar"
+  else gate 3 FAIL "spark jar $jar missing"; fi
 done
 echo "  spark python: $(dc exec -T spark-streaming python3 --version 2>&1)"
 
