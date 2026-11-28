@@ -6,7 +6,10 @@
 #   2  pipeline containers keep running (no restart)
 #   3  Python dependencies and Spark connector jars
 #   5  poll IDs: format, one collected_at per poll, status/information disjoint
-#   7  PostgreSQL latest state: one row per station, matches Silver
+#   7  PostgreSQL latest state == latest Silver observation, every field
+#      (tests/integration/latest_state_reconcile.sh)
+# A query that fails or returns nothing fails the run (pseudo-gate "queries"),
+# and so does a catch-up timeout (pseudo-gate "catchup").
 #   10 Bronze rows == Kafka end offsets per partition, Kafka metadata present
 #   11 Silver grain unique + data-quality gate (dq_checks.py)
 #   12 four queries with four distinct checkpoints
@@ -76,9 +79,22 @@ expect() {  # $1 = gate, $2 = description, $3 = expected, $4 = actual
   if [ "$3" = "$4" ]; then gate "$1" PASS "$2 = $4"; else gate "$1" FAIL "$2: expected '$3', got '$4'"; fi
 }
 dc() { docker compose "${COMPOSE_ARGS[@]}" "$@"; }
-trino() { dc exec -T trino trino --output-format TSV --execute "$1" 2>>"$LOG_DIR/trino.err"; }
-psql_q() { dc exec -T postgres psql -U "${POSTGRES_USER:-citibike}" -d citibike -Atc "$1"; }
-kafka() { dc exec -T kafka "/opt/kafka/bin/$1" --bootstrap-server kafka:29092 "${@:2}"; }
+# Every query goes through checked(): a non-zero exit or an empty result is
+# logged to $QUERY_FAILURES (which fails the run) and replaced by a marker that
+# is unique per call, so two failed queries never compare equal.
+QUERY_FAILURES="$LOG_DIR/query-failures.log"
+checked() {
+  local out rc=0
+  out=$("$@" 2>>"$LOG_DIR/query.err") || rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    printf 'exit=%s output=%s: %.300s\n' "$rc" "$([ -z "$out" ] && echo empty || echo present)" "$*" >>"$QUERY_FAILURES"
+    echo "QUERY_FAILED_$(date +%s%N)_$RANDOM"
+    return 0
+  fi
+  printf '%s\n' "$out"
+}
+trino() { checked dc exec -T trino trino --output-format TSV --execute "$1"; }
+kafka() { checked dc exec -T kafka "/opt/kafka/bin/$1" --bootstrap-server kafka:29092 "${@:2}"; }
 end_offsets_total() { kafka kafka-get-offsets.sh --topic "$1" | awk -F: '{s += $3} END {print s + 0}'; }
 step() { echo; echo "== $*"; }
 
@@ -153,9 +169,14 @@ while :; do
   bronze=$(trino "SELECT count(*) FROM iceberg.bronze.gbfs_status")
   silver=$(trino "SELECT count(*) FROM iceberg.silver.gbfs_status")
   keys=$(trino "SELECT count(*) FROM (SELECT DISTINCT station_id, poll_id FROM iceberg.bronze.gbfs_status WHERE dq_is_valid)")
-  [ "$lag" = 0 ] && [ "$bronze" = "$ends" ] && [ -n "$keys" ] && [ "$silver" = "$keys" ] && break
+  if [ "$lag" = 0 ] && [ "$bronze" = "$ends" ] && [ "$silver" = "$keys" ] \
+     && [ "${ends:-0}" -gt 0 ] 2>/dev/null; then
+    gate catchup PASS "consumers caught up: lag 0, Bronze = end offsets, Silver = valid keys"
+    break
+  fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "  not caught up after ${CATCHUP_TIMEOUT}s: lag=$lag bronze=$bronze/$ends silver=$silver/$keys"; break
+    gate catchup FAIL "not caught up after ${CATCHUP_TIMEOUT}s: lag=$lag bronze=$bronze/$ends silver=$silver/$keys"
+    break
   fi
   sleep 15
 done
@@ -190,14 +211,12 @@ done
 expect 5 "poll_id shared by status and information" "0" \
   "$(trino "SELECT count(*) FROM (SELECT poll_id FROM iceberg.silver.gbfs_status INTERSECT SELECT poll_id FROM iceberg.silver.gbfs_station_information)")"
 
-step "Gate 7: PostgreSQL latest state"
-pg=$(psql_q "SELECT count(*), count(DISTINCT station_id), floor(extract(epoch FROM max(collected_at)) * 1000)::bigint FROM station_status_latest" | tr '|' ' ')
-sv=$(trino "SELECT count(DISTINCT station_id), count(DISTINCT station_id), CAST(floor(to_unixtime(max(collected_at)) * 1000) AS bigint) FROM iceberg.silver.gbfs_status" | tr '\t' ' ')
-expect 7 "PostgreSQL (rows, distinct stations, max collected_at ms) == Silver" "$sv" "$pg"
-expect 7 "stations whose PostgreSQL row is not their latest Silver observation" "0" "$(
-  psql_q "SELECT station_id || ',' || floor(extract(epoch FROM collected_at) * 1000)::bigint FROM station_status_latest ORDER BY 1" > "$LOG_DIR/pg_latest.csv"
-  trino "SELECT station_id || ',' || CAST(CAST(floor(to_unixtime(max(collected_at)) * 1000) AS bigint) AS varchar) FROM iceberg.silver.gbfs_status GROUP BY station_id ORDER BY 1" > "$LOG_DIR/silver_latest.csv"
-  comm -3 <(sort "$LOG_DIR/pg_latest.csv") <(sort "$LOG_DIR/silver_latest.csv") | grep -c .)"
+step "Gate 7: PostgreSQL latest state == latest Silver observation (every field)"
+if bash tests/integration/latest_state_reconcile.sh "$LOG_DIR/gate7" >"$LOG_DIR/gate7.log" 2>&1; then
+  gate 7 PASS "$(grep '^\[PASS\]' "$LOG_DIR/gate7.log" | tail -1)"
+else
+  gate 7 FAIL "$(grep '^\[FAIL\]' "$LOG_DIR/gate7.log" | head -5 | tr '\n' ' ') (see $LOG_DIR/gate7.log)"
+fi
 
 step "Gate 13: restarting spark-streaming adds nothing"
 before_b=$(trino "SELECT count(*) FROM iceberg.bronze.gbfs_status")
@@ -240,6 +259,12 @@ if [ "${RUN_EXTRA:-0}" = 1 ]; then
   else
     gate 8 FAIL "test_latest_state_recovery failed (see $LOG_DIR/recovery.log)"; gate 9 FAIL "see gate 8"
   fi
+fi
+
+if [ -s "$QUERY_FAILURES" ]; then
+  gate queries FAIL "$(wc -l <"$QUERY_FAILURES") query(ies) failed or returned nothing (see $QUERY_FAILURES)"
+else
+  gate queries PASS "every query succeeded with output"
 fi
 
 echo

@@ -65,6 +65,11 @@ bash tests/integration/str_trino_read.sh
 # (gbfs_mock.py); GATE_SOURCE=real để dùng API GBFS thật. RUN_EXTRA=1 chạy thêm
 # smoke test (gate 15), str_trino_read.sh (gate 14) và test_latest_state_recovery
 # (gate 8, 9; cần confluent-kafka, psycopg trên host). Khoảng 15 phút.
+# Gate 7 (tests/integration/latest_state_reconcile.sh) so mọi field của
+# station_status_latest với observation mới nhất mỗi trạm trong Silver; truy vấn
+# lỗi hoặc rỗng, trạm thiếu/thừa, giá trị khác đều làm gate fail
+# (kiểm bằng tests/unit/test_latest_state_reconcile.py, không cần Docker).
+# Mọi truy vấn khác của gate lỗi/rỗng làm fail "queries"; hết giờ chờ làm fail "catchup".
 RUN_EXTRA=1 bash tests/integration/streaming_core_gate.sh
 GATE_SOURCE=real bash tests/integration/streaming_core_gate.sh
 
