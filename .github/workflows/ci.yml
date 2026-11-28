@@ -96,6 +96,17 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # The runner image ships Compose 2.38.2, which rejects build.provenance in
+      # docker-compose.yml. Pin the version the stack is developed and tested with.
+      - uses: docker/setup-compose-action@54042514f505b273907334ae2b9cdbb9a0213c1a  # v2.4.0
+        with:
+          version: v5.6.1
+      - name: Tool versions
+        run: |
+          docker version
+          docker compose version
+          docker buildx version
+          test "$(docker compose version --short)" = "5.6.1"
       - name: docker-compose.yml is valid for every profile
         run: docker compose --profile pipeline --profile tools --profile airflow config -q
       - name: Test override for the GBFS mock is valid
