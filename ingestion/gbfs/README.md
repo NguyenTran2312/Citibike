@@ -313,7 +313,13 @@ docker compose --profile pipeline exec gbfs-poller ls /app/data/gbfs/station_sta
 - Bỏ qua bước Kafka nếu thư mục đã có `kafka_delivery.json`
   (trường hợp chỉ MinIO lỗi), rồi upload lại raw nếu `GBFS_ARCHIVE_RAW=true`.
 - Thành công trọn vẹn thì thư mục bị xóa; lỗi thì thư mục vẫn được giữ.
-- Thư mục của feed sai cấu trúc (không có `valid.jsonl`) không replay được.
+- Trước khi gửi Kafka (cả lần polling thường lẫn replay), số dòng của
+  `valid.jsonl` + `invalid.jsonl` phải bằng số trạm trong `raw.json`; nếu
+  không, không gửi gì và giữ thư mục. Khi replay, output chuẩn hóa thiếu
+  (poller bị kill hoặc lỗi I/O giữa lúc ghi, file rỗng hoặc dòng ghi dở) được
+  chuẩn hóa lại từ `raw.json` với `poll_id` và `collected_at` gốc, và
+  `kafka_delivery.json` cũ bị bỏ để gửi lại cả lần polling.
+- Thư mục của feed sai cấu trúc (`raw.json` không chuẩn hóa được) không replay được.
 
 ## Lưu raw JSON lên MinIO (STR-04)
 

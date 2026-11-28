@@ -162,6 +162,9 @@ def finish_poll(feed_name, poll_id, collected_at, output_dir, publish):
 
     if publish and not already_delivered:
         try:
+            # Không gửi (và vì vậy không xóa thư mục) khi valid.jsonl +
+            # invalid.jsonl chưa chứa đủ mọi trạm của raw.json.
+            check_normalized(output_dir)
             publish_to_kafka(feed_name, poll_id, output_dir)
         except Exception as error:
             publish_error = error
@@ -193,25 +196,82 @@ def finish_poll(feed_name, poll_id, collected_at, output_dir, publish):
         raise publish_error
 
 
+class IncompletePollError(RuntimeError):
+    """valid.jsonl + invalid.jsonl không chứa đủ mọi trạm của raw.json."""
+
+
+def _json_lines(path):
+    """Số dòng JSON hoàn chỉnh trong file; file không có = 0. Dòng ghi dở
+    (process bị kill giữa chừng) không parse được nên không được tính."""
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open(encoding="utf-8") as file:
+        for line in file:
+            if not line.endswith("\n"):
+                break
+            try:
+                json.loads(line)
+            except ValueError:
+                break
+            count += 1
+    return count
+
+
+def check_normalized(output_dir):
+    """Raise IncompletePollError nếu số message đã chuẩn hóa (valid + invalid)
+    khác số trạm trong raw.json, ví dụ khi poller bị kill trong lúc ghi
+    valid.jsonl. raw.json được ghi trước khi chuẩn hóa nên là nguồn đối chiếu."""
+    raw = json.loads((output_dir / "raw.json").read_text(encoding="utf-8"))
+    try:
+        stations = raw["payload"]["data"]["stations"]
+    except (KeyError, TypeError):
+        stations = None   # feed sai cấu trúc: không bao giờ coi là đủ
+    expected = len(stations) if isinstance(stations, list) else None
+    written = (_json_lines(output_dir / "valid.jsonl")
+               + _json_lines(output_dir / "invalid.jsonl"))
+    if expected is None or written != expected:
+        raise IncompletePollError(
+            f"{output_dir}: {written} message đã chuẩn hóa, raw.json có "
+            f"{expected} trạm"
+        )
+
+
 def replay_poll(output_dir):
-    """Gửi lại một thư mục polling đã bị giữ lại, với đúng poll_id cũ."""
+    """Gửi lại một thư mục polling đã bị giữ lại, với đúng poll_id cũ.
+
+    Nếu valid.jsonl / invalid.jsonl không đủ (chuẩn hóa bị ngắt giữa chừng),
+    chuẩn hóa lại từ raw.json với poll_id và collected_at gốc trước khi gửi.
+    """
     output_dir = Path(output_dir)
     feed_name = output_dir.parent.name
 
     if feed_name not in MODELS:
         raise ValueError(f"Thư mục không thuộc feed được hỗ trợ: {output_dir}")
-    if not (output_dir / "valid.jsonl").exists():
-        raise ValueError(
-            f"{output_dir} không có valid.jsonl (feed lỗi), không replay được"
-        )
 
     raw = json.loads((output_dir / "raw.json").read_text(encoding="utf-8"))
+    collected_at = datetime.fromisoformat(raw["collected_at"])
     logger.info("Replay feed=%s poll_id=%s", feed_name, raw["poll_id"])
+
+    try:
+        check_normalized(output_dir)
+    except IncompletePollError as incomplete:
+        logger.warning("Chuẩn hóa lại từ raw.json: %s", incomplete)
+        try:
+            write_messages(feed_name, raw["payload"], raw["poll_id"],
+                           collected_at, output_dir)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"{output_dir}: raw.json không chuẩn hóa được (feed lỗi), "
+                f"không replay được: {error!r}"
+            ) from error
+        # Kafka đã xác nhận một bản không đủ: gửi lại cả lần polling.
+        (output_dir / "kafka_delivery.json").unlink(missing_ok=True)
 
     finish_poll(
         feed_name,
         raw["poll_id"],
-        datetime.fromisoformat(raw["collected_at"]),
+        collected_at,
         output_dir,
         publish=True,
     )
