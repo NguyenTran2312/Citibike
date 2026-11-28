@@ -1,0 +1,171 @@
+{
+  "$defs": {
+    "RentalUris": {
+      "properties": {
+        "android": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Android"
+        },
+        "ios": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ios"
+        },
+        "web": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Web"
+        }
+      },
+      "title": "RentalUris",
+      "type": "object"
+    }
+  },
+  "description": "Message station_information: có poll_id, không có schema_version.",
+  "properties": {
+    "last_updated": {
+      "maximum": 4102444800,
+      "minimum": 0,
+      "title": "Last Updated",
+      "type": "integer"
+    },
+    "collected_at": {
+      "format": "date-time",
+      "title": "Collected At",
+      "type": "string"
+    },
+    "poll_id": {
+      "minLength": 1,
+      "title": "Poll Id",
+      "type": "string"
+    },
+    "station_id": {
+      "minLength": 1,
+      "title": "Station Id",
+      "type": "string"
+    },
+    "name": {
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "lat": {
+      "maximum": 90,
+      "minimum": -90,
+      "title": "Lat",
+      "type": "number"
+    },
+    "lon": {
+      "maximum": 180,
+      "minimum": -180,
+      "title": "Lon",
+      "type": "number"
+    },
+    "short_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Short Name"
+    },
+    "capacity": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Capacity"
+    },
+    "is_virtual_station": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Is Virtual Station"
+    },
+    "region_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Region Id"
+    },
+    "rental_uris": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RentalUris"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "is_charging": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Is Charging"
+    }
+  },
+  "required": [
+    "last_updated",
+    "collected_at",
+    "poll_id",
+    "station_id",
+    "name",
+    "lat",
+    "lon"
+  ],
+  "title": "StationInformationMessage",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

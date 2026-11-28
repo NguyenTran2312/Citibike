@@ -1,0 +1,116 @@
+# Pull-request checks: no Docker stack, a few minutes.
+# Integration tests that start the Compose stack are in integration.yml.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # same as infra/python/Dockerfile
+      - run: pip install ruff==0.8.4
+      # Syntax errors and undefined names only; no style rules yet.
+      - run: ruff check --select E9,F63,F7,F82 .
+      # The Spark jobs run on the Python of apache/spark:3.5.6
+      # (streaming/jobs/gbfs_history.py notes 3.8): keep them parseable by 3.8.
+      - name: Spark code parses as Python 3.8
+        run: |
+          python - <<'EOF'
+          import ast, pathlib, sys
+          bad = 0
+          for root in ("streaming", "tests/streaming"):
+              for path in sorted(pathlib.Path(root).rglob("*.py")):
+                  try:
+                      ast.parse(path.read_text(encoding="utf-8"), str(path), feature_version=(3, 8))
+                  except SyntaxError as error:
+                      print(f"{path}: {error}")
+                      bad += 1
+          sys.exit(bad)
+          EOF
+      - name: Shell scripts parse
+        run: for f in infra/*/*.sh tests/smoke/*.sh tests/integration/*.sh; do bash -n "$f"; done
+
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: infra/python/requirements.txt
+      - run: pip install -r infra/python/requirements.txt
+      - run: python -m unittest discover -s tests/unit -v
+        env:
+          PYTHONPATH: .
+
+  contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: ingestion/gbfs/requirements.txt
+      - run: pip install -r ingestion/gbfs/requirements.txt
+      # The committed JSON Schemas must be exactly what the Pydantic models export.
+      - name: JSON Schemas match the Pydantic models
+        run: |
+          python -m ingestion.gbfs.export_schemas
+          git diff --exit-code ingestion/gbfs/json_schemas
+        env:
+          PYTHONPATH: .
+      # Spark unit + producer/consumer contract tests, in the runtime image.
+      # A skipped test fails the job: the contract tests skip when the JSON
+      # Schemas are missing, and the Spark tests skip without pyspark.
+      - name: Spark unit and contract tests (apache/spark:3.5.6)
+        run: |
+          docker run --rm -v "$PWD":/opt/project:ro -w /opt/project --entrypoint bash \
+            apache/spark:3.5.6 -c '
+              export PYTHONPATH=/opt/project:/opt/spark/python:$(ls /opt/spark/python/lib/py4j-*.zip)
+              export PYSPARK_PYTHON=python3 PYSPARK_DRIVER_PYTHON=python3
+              python3 -W ignore::ResourceWarning -c "
+          import sys, unittest
+          result = unittest.TextTestRunner(verbosity=2).run(
+              unittest.defaultTestLoader.discover(\"tests/streaming\"))
+          print(\"skipped:\", len(result.skipped))
+          sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)
+          "'
+
+  compose:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # The runner image ships Compose 2.38.2, which rejects build.provenance in
+      # docker-compose.yml. Pin the version the stack is developed and tested with.
+      - uses: docker/setup-compose-action@54042514f505b273907334ae2b9cdbb9a0213c1a  # v2.4.0
+        with:
+          version: v5.6.1
+      - name: Tool versions
+        run: |
+          docker version
+          docker compose version
+          docker buildx version
+          test "$(docker compose version --short)" = "5.6.1"
+      - name: docker-compose.yml is valid for every profile
+        run: docker compose --profile pipeline --profile tools --profile airflow config -q
+      - name: Test override for the GBFS mock is valid
+        run: |
+          GBFS_MOCK_CONTROL_DIR=/tmp/gbfs-mock docker compose \
+            -f docker-compose.yml -f tests/integration/poller-shutdown.compose.yml \
+            --profile pipeline config -q

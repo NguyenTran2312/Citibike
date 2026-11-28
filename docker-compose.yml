@@ -357,7 +357,11 @@ services:
     build: *python-build
     pull_policy: build
     profiles: [pipeline]
-    restart: on-failure:5
+    restart: unless-stopped
+    # On SIGTERM the poller stops retrying GBFS but finishes a poll it already fetched:
+    # Kafka flush (<= 35 s) + MinIO upload (<= ~60 s). A poll cut off later is kept in
+    # gbfs-spool for --replay (tests/integration/test_poller_shutdown.py).
+    stop_grace_period: 120s
     command: [python, -m, ingestion.gbfs.poller]
     environment:
       <<: *s3-env
@@ -370,6 +374,11 @@ services:
       GBFS_STATUS_TOPIC: gbfs.station_status
       GBFS_INFORMATION_TOPIC: gbfs.station_information
       GBFS_INVALID_TOPIC: gbfs.invalid
+    # Replaces the x-app mount list (YAML merge does not append lists); the poller only
+    # needs ingestion/. Poll directories kept for --replay must survive a recreated container.
+    volumes:
+      - ./ingestion:/app/ingestion:ro
+      - gbfs-spool:/app/data
     depends_on:
       kafka-init: {condition: service_completed_successfully}
       minio-init: {condition: service_completed_successfully}
@@ -377,13 +386,16 @@ services:
   latest-state-consumer:
     <<: *app
     profiles: [pipeline]
-    restart: on-failure:5
+    # Fail fast and let Docker restart with backoff (100 ms doubling, capped at 1 min). Offsets are
+    # committed only after the PostgreSQL write, so a restart replays into an idempotent UPSERT.
+    restart: unless-stopped
     command: [python, -m, serving.latest_state_consumer]
     environment:
       TZ: UTC
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_GROUP_ID: citibike-postgres-latest
       GBFS_STATUS_TOPIC: gbfs.station_status
+      GBFS_INVALID_TOPIC: gbfs.invalid
       PGHOST: postgres
       PGPORT: '5432'
       PGDATABASE: citibike
@@ -399,7 +411,9 @@ services:
     <<: *spark
     profiles: [pipeline]
     hostname: spark-streaming
-    restart: on-failure:5
+    # Offsets and progress live in the checkpoints, so a restart resumes where the
+    # queries stopped; keep restarting (on-failure:5 gave up after a few seconds).
+    restart: unless-stopped
     environment:
       <<: *spark-env
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
@@ -408,7 +422,13 @@ services:
       GBFS_INFORMATION_TOPIC: gbfs.station_information
       STATUS_CHECKPOINT_LOCATION: s3a://checkpoints/status-history/
       INFORMATION_CHECKPOINT_LOCATION: s3a://checkpoints/information-history/
+      SILVER_STATUS_CHECKPOINT_LOCATION: s3a://checkpoints/silver-status/
+      SILVER_INFORMATION_CHECKPOINT_LOCATION: s3a://checkpoints/silver-information/
       STREAM_TRIGGER_INTERVAL: ${STREAM_TRIGGER_INTERVAL:-5 minutes}
+      # Must exceed the messages arriving per trigger (status ~12600 per 5 minutes).
+      MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-100000}
+      # true: stop when Kafka no longer has offsets a checkpoint needs (streaming/README.md)
+      FAIL_ON_DATA_LOSS: ${FAIL_ON_DATA_LOSS:-true}
     entrypoint: [/opt/spark/bin/spark-submit]
     command: [--master, 'spark://spark-master:7077', --deploy-mode, client, --conf, spark.driver.host=spark-streaming, --conf, spark.driver.bindAddress=0.0.0.0, /opt/project/streaming/jobs/gbfs_history.py]
     depends_on:
@@ -500,3 +520,4 @@ volumes:
   grafana-data:
   airflow-db-data:
   airflow-logs:
+  gbfs-spool:

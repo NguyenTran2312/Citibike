@@ -1,0 +1,62 @@
+# Integration tests on the Compose stack. Not run on every pull request:
+# start it by hand (Actions > integration > Run workflow) or let it run nightly.
+name: integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      spark_recovery:
+        description: "Also run tests/integration/test_spark_recovery.py (~30 min)"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 19 * * *"   # 02:00 Asia/Ho_Chi_Minh
+
+permissions:
+  contents: read
+
+env:
+  COMPOSE_PROJECT_NAME: citibike-itest
+
+jobs:
+  streaming-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      # Same pinned Compose as ci.yml (the runner's 2.38.2 rejects build.provenance).
+      - uses: docker/setup-compose-action@54042514f505b273907334ae2b9cdbb9a0213c1a  # v2.4.0
+        with:
+          version: v5.6.1
+      - name: Tool versions
+        run: |
+          docker version
+          docker compose version
+          docker buildx version
+          test "$(docker compose version --short)" = "5.6.1"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install confluent-kafka==2.16.1 "psycopg[binary]==3.2.6"
+      - name: Infrastructure smoke test (gate 15)
+        run: docker compose up -d --build && bash tests/smoke/infra_smoke.sh
+      - name: Kafka -> Spark -> Iceberg on fixtures (STR-08, STR-09, STR-10)
+        run: |
+          bash tests/integration/str08_bronze.sh
+          bash tests/integration/str09_silver.sh
+          bash tests/integration/str10_silver_information.sh
+      - name: Trino reads Bronze and Silver (gate 14)
+        run: bash tests/integration/str_trino_read.sh
+      - name: Streaming Core gate on the GBFS mock (gates 2, 3, 5, 7, 8, 9, 10-13)
+        run: RUN_EXTRA=1 bash tests/integration/streaming_core_gate.sh
+      - name: Spark crash/restart recovery (STR-12)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.spark_recovery }}
+        run: python -m unittest tests.integration.test_spark_recovery -v
+      - name: Collect logs
+        if: always()
+        run: docker compose logs --no-color > compose.log 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compose-logs
+          path: compose.log

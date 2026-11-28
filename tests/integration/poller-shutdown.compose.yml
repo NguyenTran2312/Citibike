@@ -1,0 +1,19 @@
+# Override cho tests/integration/test_poller_shutdown.py: poller gọi GBFS giả lập
+# (gbfs-mock) thay vì API thật, để điều khiển được độ trễ và lỗi 503.
+# Đường dẫn tương đối tính từ thư mục gốc repository.
+services:
+  gbfs-mock:
+    image: citibike/python:local
+    pull_policy: never
+    profiles: [pipeline]
+    command: [python, /itest/gbfs_mock.py]
+    networks: [citibike]
+    volumes:
+      - ./tests/integration:/itest:ro
+      - ${GBFS_MOCK_CONTROL_DIR:?set GBFS_MOCK_CONTROL_DIR}:/control
+
+  gbfs-poller:
+    environment:
+      GBFS_DISCOVERY_URL: http://gbfs-mock:8000/gbfs.json
+    depends_on:
+      gbfs-mock: {condition: service_started}
