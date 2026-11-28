@@ -251,7 +251,13 @@ bash tests/integration/str10_silver_information.sh
 python -m unittest tests.integration.test_spark_recovery -v
 ```
 
-`test_matches_producer_json_schemas` so tên field với `ingestion/gbfs/json_schemas/*.schema.json` của producer; test này tự skip khi các file đó chưa có trên nhánh.
+Contract với producer (`ingestion/gbfs/json_schemas/*.schema.json`, xuất từ Pydantic bằng `python -m ingestion.gbfs.export_schemas`; `docs/contracts.md` 1.4, 1.5, 2.3.2):
+
+- `test_matches_producer_json_schemas`: cùng tên field.
+- `test_types_match_producer_json_schemas`: kiểu JSON khớp kiểu Spark (`integer` → Integer/Long, `number` → Double, `string`, `boolean`, `array` và object lồng nhau như `vehicle_types_available`, `rental_uris`).
+- `test_required_fields_are_enforced_by_spark_rules`: field mà JSON Schema bắt buộc, khi thiếu hoặc `null`, làm message thành `VALIDATION_ERROR`; field không bắt buộc thiếu (hoặc `null` khi schema cho phép) thì message vẫn hợp lệ.
+
+Các test này tự skip khi thư mục JSON Schema không có trên nhánh; CI coi một test bị skip là lỗi.
 
 ### Kết quả đã ghi nhận (23/11/2026)
 

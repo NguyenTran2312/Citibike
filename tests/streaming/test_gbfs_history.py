@@ -104,6 +104,67 @@ class ContractSchemaTest(unittest.TestCase):
                 props = json.loads((PRODUCER_SCHEMAS / filename).read_text())["properties"]
                 self.assertEqual(set(props), set(spark_schema.fieldNames()))
 
+    def test_types_match_producer_json_schemas(self):
+        """Every producer field maps to a compatible Spark type, nested objects included."""
+        if not PRODUCER_SCHEMAS.is_dir():
+            self.skipTest(f"{PRODUCER_SCHEMAS} not on this branch yet")
+        for filename, spark_schema in PRODUCER_SCHEMA_FILES.items():
+            with self.subTest(filename):
+                doc = json.loads((PRODUCER_SCHEMAS / filename).read_text())
+                _assert_struct_matches(self, doc, doc, spark_schema, filename)
+
+
+# JSON Schema type -> Spark types that from_json maps it to without loss.
+JSON_TO_SPARK = {
+    "integer": ("IntegerType", "LongType"),
+    "number": ("DoubleType",),
+    "string": ("StringType",),
+    "boolean": ("BooleanType",),
+}
+
+PRODUCER_SCHEMA_FILES = {} if SparkSession is None else {
+    "station_status.schema.json": STATION_STATUS_SCHEMA,
+    "station_information.schema.json": STATION_INFORMATION_SCHEMA,
+    "invalid.schema.json": INVALID_SCHEMA,
+}
+
+
+def _resolve(doc, node):
+    """Follow a local $ref and drop the `null` branch of `anyOf: [X, null]`."""
+    if "$ref" in node:
+        name = node["$ref"].rsplit("/", 1)[-1]
+        return _resolve(doc, doc["$defs"][name])
+    branches = [b for b in node.get("anyOf", []) if b.get("type") != "null"]
+    if len(branches) == 1:
+        return _resolve(doc, branches[0])
+    return node
+
+
+def _assert_struct_matches(test, doc, node, spark_struct, where):
+    props = node["properties"]
+    test.assertEqual(set(props), set(spark_struct.fieldNames()), f"{where}: field names")
+    for name, prop in props.items():
+        _assert_type_matches(test, doc, _resolve(doc, prop),
+                             spark_struct[name].dataType, f"{where}.{name}")
+
+
+def _assert_type_matches(test, doc, node, spark_type, where):
+    json_type = node.get("type")
+    spark_name = type(spark_type).__name__
+    if json_type is None:
+        # raw_payload is "any JSON value": Spark keeps its JSON text as a string.
+        test.assertEqual(spark_name, "StringType", f"{where}: any-typed field must be a string")
+    elif json_type == "array":
+        test.assertEqual(spark_name, "ArrayType", where)
+        _assert_type_matches(test, doc, _resolve(doc, node["items"]),
+                             spark_type.elementType, f"{where}[]")
+    elif json_type == "object":
+        test.assertEqual(spark_name, "StructType", where)
+        _assert_struct_matches(test, doc, node, spark_type, where)
+    else:
+        test.assertIn(spark_name, JSON_TO_SPARK[json_type],
+                      f"{where}: JSON {json_type} read as Spark {spark_name}")
+
 
 @unittest.skipIf(SparkSession is None, "pyspark not installed")
 class ParseValidateTest(unittest.TestCase):
@@ -173,6 +234,49 @@ class ParseValidateTest(unittest.TestCase):
         payloads = {r.error_type: r.raw_payload for r in rows}
         self.assertEqual(json.loads(payloads["VALIDATION_ERROR"]), {"num_bikes_available": 5})
         self.assertEqual(payloads["PARSE_ERROR"], '{"station_id": "abc", ')
+
+    def test_required_fields_are_enforced_by_spark_rules(self):
+        """Nullability contract with the producer's JSON Schema:
+        * required field absent or null -> invalid in Spark (VALIDATION_ERROR);
+        * optional field absent -> still valid; optional field null -> still valid
+          when the JSON Schema allows null (anyOf [..., null]).
+        Not asserted: null in an optional field the producer never sends as null
+        (schema_version). from_json cannot tell an absent value from null, so the
+        any-typed raw_payload is required to be non-null in Spark (gbfs.invalid is
+        not streamed; see docs/contracts.md 2.3.2)."""
+        if not PRODUCER_SCHEMAS.is_dir():
+            self.skipTest(f"{PRODUCER_SCHEMAS} not on this branch yet")
+        feeds = {
+            "station_status.schema.json": ("status", STATION_STATUS_SCHEMA, _valid_status),
+            "station_information.schema.json": ("information", STATION_INFORMATION_SCHEMA,
+                                                _valid_information),
+            "invalid.schema.json": ("invalid", INVALID_SCHEMA,
+                                    lambda: json.loads(_fixture_lines("invalid.jsonl")[0])),
+        }
+        for filename, (feed, schema, valid) in feeds.items():
+            doc = json.loads((PRODUCER_SCHEMAS / filename).read_text())
+            required = set(doc.get("required", []))
+            self.assertTrue(self._one(valid(), feed, schema).dq_is_valid, f"{filename}: base")
+            for name, prop in doc["properties"].items():
+                allows_null = any(b.get("type") == "null" for b in prop.get("anyOf", []))
+                for how in ("absent", "null"):
+                    if how == "null" and name not in required and not allows_null:
+                        continue
+                    msg = valid()
+                    if how == "absent":
+                        msg.pop(name, None)
+                    else:
+                        msg[name] = None
+                    with self.subTest(feed=feed, field=name, value=how):
+                        row = self._one(msg, feed, schema)
+                        if name in required:
+                            self.assertFalse(row.dq_is_valid, f"{name} {how} must be invalid")
+                            self.assertEqual(row.dq_error_type, VALIDATION_ERROR)
+                            self.assertIn(f"missing {name}", row.dq_error_message)
+                        else:
+                            self.assertTrue(row.dq_is_valid,
+                                            f"optional {name} {how} must stay valid: "
+                                            f"{row.dq_error_message}")
 
     def test_schema_version_may_be_absent(self):
         msg = _valid_status()
